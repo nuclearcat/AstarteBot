@@ -2,7 +2,6 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 
 use crate::db;
-use crate::types::MemoryRow;
 
 /// Validate segment format: "chat:{id}", "person:{id}", "global", "bot"
 pub fn validate_segment(segment: &str) -> Result<()> {
@@ -35,9 +34,4 @@ pub async fn set(pool: &SqlitePool, segment: &str, key: &str, value: &str) -> Re
 pub async fn get(pool: &SqlitePool, segment: &str, key: &str) -> Result<Option<String>> {
     validate_segment(segment)?;
     db::memory_get(pool, segment, key).await
-}
-
-pub async fn list(pool: &SqlitePool, segment: &str) -> Result<Vec<MemoryRow>> {
-    validate_segment(segment)?;
-    db::memory_list(pool, segment).await
 }

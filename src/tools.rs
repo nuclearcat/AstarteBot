@@ -16,7 +16,7 @@ use crate::db;
 use crate::mcp::McpManager;
 use crate::memory;
 use crate::rag::RagEngine;
-use crate::types::ToolDefinition;
+use crate::types::{ChatMessage, ChatRequest, ChatResponse, MessageContent, ToolDefinition};
 
 fn tool(name: &str, description: &str, parameters: Value) -> ToolDefinition {
     ToolDefinition {
@@ -34,37 +34,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         // --- Notes ---
         tool(
-            "store_note",
-            "Create and permanently save a new note. Use this when a user asks you to remember something, save information, or when you want to persist important details for later. Notes survive conversation resets. Each note belongs to a segment that controls its visibility scope:\n\
-             - 'chat:{chat_id}': visible only in this specific chat/group\n\
-             - 'person:{user_id}': private notes about a specific user (visible across all chats)\n\
-             - 'global': shared across all chats and users\n\
-             - 'bot': your own private knowledge (personality, learned preferences)\n\
-             Returns the created note's ID for future reference.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "segment": {
-                        "type": "string",
-                        "description": "Which scope to store the note in. Examples: 'global', 'bot', 'chat:-1001234567890', 'person:123456789'. Use the chat_id and user_id from your system prompt context."
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "A short, descriptive title for the note (used in search results)"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The full note content. Can be any length."
-                    },
-                    "tags": {
-                        "type": "string",
-                        "description": "Optional comma-separated tags for categorization and easier searching. Example: 'recipe,cooking,italian'"
-                    }
-                },
-                "required": ["segment", "title", "content"]
-            }),
-        ),
-        tool(
             "search_notes",
             "Search through all saved notes by keyword or regex pattern. Use this when a user asks 'do you remember...', 'what did I say about...', or when you need to find previously saved information. Returns a list of matching notes with their IDs (use read_note to get full content). Searches across title, content, and tags fields.",
             json!({
@@ -72,7 +41,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search term. For keyword search: any word or phrase (e.g., 'birthday', 'project deadline'). For regex: a valid regex pattern (e.g., '\\bmeeting\\b.*2024')."
+                        "description": "The search term. For keyword search: any word or phrase (e.g., 'birthday', 'project deadline'). For regex: a valid regex pattern (e.g., '\\\\bmeeting\\\\b.*2024')."
                     },
                     "segment": {
                         "type": "string",
@@ -98,76 +67,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["note_id"]
-            }),
-        ),
-        tool(
-            "delete_note",
-            "Permanently delete a note by its ID. Use this when a user asks to forget something or when information is no longer relevant. This action cannot be undone.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "note_id": {
-                        "type": "integer",
-                        "description": "The numeric ID of the note to delete."
-                    }
-                },
-                "required": ["note_id"]
-            }),
-        ),
-        // --- Memory (key-value store) ---
-        tool(
-            "memory_set",
-            "Store or update a key-value pair in a memory segment. Memory is a simple key-value store (like a dictionary) — different from notes which are longer-form documents. Use memory for quick facts, preferences, settings, or flags. If the key already exists, its value is overwritten.\n\
-             Segments control scope: 'chat:{chat_id}' (this chat only), 'person:{user_id}' (about this user), 'global' (everywhere), 'bot' (your own data).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "segment": {
-                        "type": "string",
-                        "description": "Scope for this memory. Examples: 'global', 'bot', 'chat:-1001234567890', 'person:123456789'."
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "The key name. Use descriptive, namespaced keys like 'user_language', 'preferred_name', 'timezone'."
-                    },
-                    "value": {
-                        "type": "string",
-                        "description": "The value to store. Keep it concise — memory is for quick lookups, not long documents."
-                    }
-                },
-                "required": ["segment", "key", "value"]
-            }),
-        ),
-        tool(
-            "memory_get",
-            "Retrieve a single value from memory by its key. Use this to look up previously stored facts, preferences, or settings. Returns null if the key doesn't exist.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "segment": {
-                        "type": "string",
-                        "description": "The memory segment to search in. Example: 'person:123456789', 'chat:-1001234567890', 'global', 'bot'."
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "The exact key to look up."
-                    }
-                },
-                "required": ["segment", "key"]
-            }),
-        ),
-        tool(
-            "memory_list",
-            "List ALL key-value pairs stored in a specific memory segment. Use this to see everything stored about a person, chat, or globally. Helpful when you need an overview of what you know.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "segment": {
-                        "type": "string",
-                        "description": "The memory segment to list. Example: 'person:123456789', 'chat:-1001234567890', 'global', 'bot'."
-                    }
-                },
-                "required": ["segment"]
             }),
         ),
         tool(
@@ -252,6 +151,37 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["action"]
+            }),
+        ),
+        tool(
+            "expert",
+            "Ask a specialist model for deeper analysis on difficult questions. This is a higher-cost feature, so use it only when standard reasoning is likely insufficient.\n\
+             Use this with `expert_id` to select one of 3 experts:\n\
+             - 1: generic expert for deep reasoning\n\
+             - 2: generic expert for fast practical reasoning\n\
+             - 3: internet search expert (Perplexity-powered) for current web-aware answers\n\
+             Provide a clear `question` with enough context for best results.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "expert_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 3,
+                        "description": "Expert selector: 1, 2, or 3."
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "The exact question to ask the selected expert. Keep context concise but complete."
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 128,
+                        "maximum": 2048,
+                        "description": "Optional token budget for the expert answer. Default: 1024."
+                    }
+                },
+                "required": ["expert_id", "question"]
             }),
         ),
         // --- MCP Servers (CRUD) ---
@@ -496,9 +426,9 @@ pub fn definitions() -> Vec<ToolDefinition> {
              - POST data to endpoints\n\
              - Check if a URL is reachable\n\n\
              IMPORTANT — API Key Security:\n\
-             NEVER hardcode API keys in the URL or headers. Instead, first use memory_get to retrieve stored keys \
-             (e.g., memory_get segment='person:USER_ID' key='openweather_api_key'), then use the returned value. \
-             If the user gives you an API key, store it with memory_set first, then retrieve it.\n\n\
+             NEVER hardcode API keys in the URL or headers. Instead, first use unified_memory with action='get' to retrieve stored keys \
+             (e.g., unified_memory action='get' segment='person:USER_ID' key='openweather_api_key'), then use the returned value. \
+             If the user gives you an API key, store it first with unified_memory action='set', then retrieve it.\n\n\
              Retries: Automatically retries up to 3 times on server errors (5xx) and timeouts with exponential backoff.\n\
              Timeout: 10 seconds default.\n\n\
              Examples:\n\
@@ -675,6 +605,29 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["text"]
+            }),
+        ),
+        // --- Telegram Message ---
+        tool(
+            "send_message",
+            "Send a text message to a Telegram chat by chat ID. Use this when a user asks to forward/send a message to another chat/group where the bot is present.
+             The target chat must be a valid Telegram chat ID the bot is able to send to, and the message must be plain text.
+
+             Examples:
+             - Send to current chat: {\"chat_id\": -1001234567890, \"text\": \"Hello from bot!\"}",
+            json!({
+                "type": "object",
+                "properties": {
+                    "chat_id": {
+                        "type": "integer",
+                        "description": "Target Telegram chat ID (can be user, group, or supergroup ID)."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The message text to send. Keep it concise for Telegram limits."
+                    }
+                },
+                "required": ["chat_id", "text"]
             }),
         ),
         // --- MCP Server Interaction ---
@@ -971,14 +924,10 @@ pub async fn execute(
     let args: Value = serde_json::from_str(arguments).unwrap_or(json!({}));
 
     let result = match tool_name {
-        "store_note" => execute_store_note(pool, rag, &args).await,
         "search_notes" => execute_search_notes(pool, &args).await,
         "read_note" => execute_read_note(pool, &args).await,
-        "delete_note" => execute_delete_note(pool, &args).await,
-        "memory_set" => execute_memory_set(pool, rag, &args).await,
-        "memory_get" => execute_memory_get(pool, &args).await,
-        "memory_list" => execute_memory_list(pool, &args).await,
         "unified_memory" => execute_unified_memory(pool, rag, &args).await,
+        "expert" => execute_expert(pool, &args).await,
         "crud_file" => execute_crud_file(pool, &args).await,
         "crud_mcp_server" => execute_crud_mcp_server(pool, &args, user_id).await,
         // Backward-compatible aliases (if model still calls old tool names)
@@ -1003,6 +952,7 @@ pub async fn execute(
         "run_python" => execute_run_python(&args).await,
         "maigret_osint" => execute_maigret_osint(&args).await,
         "send_voice" => execute_send_voice(pool, bot, &args, chat_id).await,
+        "send_message" => execute_send_message(bot, &args).await,
         "rag_search" => execute_rag_search(rag, &args).await,
         "mcp_list_tools" => execute_mcp_list_tools(pool, mcp, &args).await,
         "mcp_call" => execute_mcp_call(pool, mcp, &args).await,
@@ -1036,32 +986,6 @@ pub async fn execute(
 }
 
 // --- Note Tools ---
-
-async fn execute_store_note(pool: &SqlitePool, rag: &RagEngine, args: &Value) -> Result<String> {
-    let segment = args["segment"].as_str().unwrap_or("global");
-    let title = args["title"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'title'"))?;
-    let content = args["content"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'content'"))?;
-    let tags = args["tags"].as_str().unwrap_or("");
-
-    let note_id = db::note_create(pool, segment, title, content, tags).await?;
-
-    // Index in RAG
-    let embed_text = format!("{}\n{}\n{}", title, content, tags);
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let _ = rag.index_record_sync("note", note_id, 0, segment, &embed_text, "", &now);
-
-    Ok(json!({
-        "success": true,
-        "note_id": note_id,
-        "message": format!("Note '{}' stored with ID {} in segment '{}'", title, note_id, segment)
-    })
-    .to_string())
-}
-
 async fn execute_search_notes(pool: &SqlitePool, args: &Value) -> Result<String> {
     let query = args["query"]
         .as_str()
@@ -1118,86 +1042,13 @@ async fn execute_read_note(pool: &SqlitePool, args: &Value) -> Result<String> {
     }
 }
 
-async fn execute_delete_note(pool: &SqlitePool, args: &Value) -> Result<String> {
-    let note_id = args["note_id"]
-        .as_i64()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'note_id'"))?;
-
-    let deleted = db::note_delete(pool, note_id).await?;
-    if deleted {
-        Ok(json!({"success": true, "message": format!("Note {} deleted", note_id)}).to_string())
-    } else {
-        Ok(json!({"success": false, "message": format!("Note {} not found", note_id)}).to_string())
-    }
-}
-
 // --- Memory Tools ---
 
-async fn execute_memory_set(pool: &SqlitePool, rag: &RagEngine, args: &Value) -> Result<String> {
-    let segment = args["segment"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'segment'"))?;
-    let key = args["key"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'key'"))?;
-    let value = args["value"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'value'"))?;
-
-    memory::set(pool, segment, key, value).await?;
-
-    // Index in RAG — query the memory row ID for dedup
-    if let Ok(Some((mem_id,))) =
-        sqlx::query_as::<_, (i64,)>("SELECT id FROM memory WHERE segment = ? AND key = ?")
-            .bind(segment)
-            .bind(key)
-            .fetch_optional(pool)
-            .await
-    {
-        let embed_text = format!("{}: {}", key, value);
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        let _ = rag.index_record_sync("memory", mem_id, 0, segment, &embed_text, "", &now);
-    }
-
-    Ok(
-        json!({"success": true, "message": format!("Stored {}[{}] = '{}'", segment, key, value)})
-            .to_string(),
-    )
-}
-
-async fn execute_memory_get(pool: &SqlitePool, args: &Value) -> Result<String> {
-    let segment = args["segment"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'segment'"))?;
-    let key = args["key"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'key'"))?;
-
-    match memory::get(pool, segment, key).await? {
-        Some(value) => Ok(json!({"key": key, "value": value, "segment": segment}).to_string()),
-        None => Ok(json!({"key": key, "value": null, "segment": segment, "message": "Key not found in this segment"}).to_string()),
-    }
-}
-
-async fn execute_memory_list(pool: &SqlitePool, args: &Value) -> Result<String> {
-    let segment = args["segment"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing 'segment'"))?;
-
-    let entries = memory::list(pool, segment).await?;
-    let items: Vec<_> = entries
-        .iter()
-        .map(|m| {
-            json!({
-                "key": m.key, "value": m.value, "updated_at": m.updated_at,
-            })
-        })
-        .collect();
-    let count = items.len();
-    Ok(json!({"segment": segment, "entries": items, "count": count}).to_string())
-}
-
-async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value) -> Result<String> {
+async fn execute_unified_memory(
+    pool: &SqlitePool,
+    rag: &RagEngine,
+    args: &Value,
+) -> Result<String> {
     let action = args["action"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'action'"))?
@@ -1221,9 +1072,9 @@ async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value
             let mut written = Vec::new();
 
             if let Some(entries) = entries {
-                let entries = entries.as_array().ok_or_else(|| {
-                    anyhow::anyhow!("'entries' must be an array for set action")
-                })?;
+                let entries = entries
+                    .as_array()
+                    .ok_or_else(|| anyhow::anyhow!("'entries' must be an array for set action"))?;
 
                 if entries.is_empty() {
                     anyhow::bail!("'entries' cannot be empty");
@@ -1285,6 +1136,16 @@ async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value
                 offset,
             )
             .await?;
+            let total = db::memory_count_filtered(
+                pool,
+                segments.as_deref(),
+                segment_like,
+                key,
+                key_prefix,
+                key_contains,
+                value_contains,
+            )
+            .await?;
 
             let items: Vec<_> = entries
                 .iter()
@@ -1301,6 +1162,7 @@ async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value
                 "action": "list",
                 "limit": limit,
                 "offset": offset,
+                "total": total,
                 "count": items.len(),
                 "entries": items,
             })
@@ -1318,10 +1180,12 @@ async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value
                 .to_string());
             }
 
-            let has_filters =
-                segments.is_some() || segment_like.is_some() || key.is_some() || key_prefix.is_some()
-                    || key_contains.is_some()
-                    || value_contains.is_some();
+            let has_filters = segments.is_some()
+                || segment_like.is_some()
+                || key.is_some()
+                || key_prefix.is_some()
+                || key_contains.is_some()
+                || value_contains.is_some();
             if !has_filters {
                 anyhow::bail!("Delete requires segment+key or at least one filter");
             }
@@ -1356,14 +1220,23 @@ async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value
             .to_string())
         }
         _ => {
-            anyhow::bail!("Unsupported action '{}'. Use one of: set, get, list, delete", action)
+            anyhow::bail!(
+                "Unsupported action '{}'. Use one of: set, get, list, delete",
+                action
+            )
         }
     }
 }
 
-async fn index_memory(pool: &SqlitePool, rag: &RagEngine, segment: &str, key: &str, value: &str) -> Result<()> {
+async fn index_memory(
+    pool: &SqlitePool,
+    rag: &RagEngine,
+    segment: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
     if let Ok(Some((mem_id,))) =
-        sqlx::query_as::<_, (i64, )>("SELECT id FROM memory WHERE segment = ? AND key = ?")
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM memory WHERE segment = ? AND key = ?")
             .bind(segment)
             .bind(key)
             .fetch_optional(pool)
@@ -1376,7 +1249,126 @@ async fn index_memory(pool: &SqlitePool, rag: &RagEngine, segment: &str, key: &s
     Ok(())
 }
 
-fn parse_segment_list(segments_arg: Option<&Value>, single_segment: Option<&str>) -> Result<Option<Vec<String>>> {
+const OPENROUTER_CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+fn expert_model(expert_id: i64) -> Result<&'static str> {
+    match expert_id {
+        1 => Ok("anthropic/claude-opus-4.6"),
+        2 => Ok("openai/gpt-5.2-pro"),
+        3 => Ok("perplexity/sonar-pro"),
+        _ => Err(anyhow::anyhow!("expert_id must be 1, 2, or 3")),
+    }
+}
+
+fn expert_kind(expert_id: i64) -> &'static str {
+    match expert_id {
+        1 | 2 => "generic",
+        3 => "internet_search",
+        _ => "unknown",
+    }
+}
+
+async fn execute_expert(pool: &SqlitePool, args: &Value) -> Result<String> {
+    let expert_id = args["expert_id"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'expert_id'"))?;
+    let question = args["question"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'question'"))?;
+
+    if question.trim().is_empty() {
+        return Ok(json!({"error": "'question' cannot be empty"}).to_string());
+    }
+
+    let model = expert_model(expert_id)?;
+    let max_tokens = args["max_tokens"].as_u64().unwrap_or(1024).clamp(128, 2048) as u32;
+
+    let api_key = match config::get(pool, "llm_token").await? {
+        Some(key) if !key.is_empty() => key,
+        _ => {
+            return Ok(
+                json!({"error": "OpenRouter API key not configured. Set it with: astartebot config set llm_token sk-..."}).to_string(),
+            );
+        }
+    };
+
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text(question.to_string())),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }],
+        tools: None,
+        max_tokens: Some(max_tokens),
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let response = match client
+        .post(OPENROUTER_CHAT_COMPLETIONS_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(
+                json!({"error": format!("Failed to contact OpenRouter: {}", e)}).to_string(),
+            );
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Ok(json!({"error": format!("OpenRouter HTTP {}: {}", status, body)}).to_string());
+    }
+
+    let body = response.text().await?;
+    let parsed = match serde_json::from_str::<ChatResponse>(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(json!({
+                "error": format!("Failed to parse OpenRouter response: {}", e),
+                "raw": body
+            })
+            .to_string());
+        }
+    };
+
+    if let Some(err) = parsed.error {
+        return Ok(json!({"error": format!("OpenRouter error: {}", err.message)}).to_string());
+    }
+
+    let answer = parsed
+        .choices
+        .and_then(|c| c.into_iter().next())
+        .and_then(|choice| choice.message.content)
+        .and_then(|content| content.as_text().map(std::string::ToString::to_string));
+
+    match answer {
+        Some(text) => Ok(json!({
+            "expert_id": expert_id,
+            "expert_type": expert_kind(expert_id),
+            "model": model,
+            "answer": text,
+        })
+        .to_string()),
+        None => Ok(json!({"error": "Expert response had no text content"}).to_string()),
+    }
+}
+
+fn parse_segment_list(
+    segments_arg: Option<&Value>,
+    single_segment: Option<&str>,
+) -> Result<Option<Vec<String>>> {
     let mut segments = Vec::new();
 
     if let Some(segment) = single_segment {
@@ -2611,7 +2603,9 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         "PATCH" => client.patch(url),
         "HEAD" => client.head(url),
         _ => {
-            return Ok(json!({"error": format!("Unsupported HTTP method: {}", method)}).to_string());
+            return Ok(
+                json!({"error": format!("Unsupported HTTP method: {}", method)}).to_string(),
+            );
         }
     };
 
@@ -3537,6 +3531,37 @@ async fn execute_send_voice(
         }
         Err(e) => Ok(json!({
             "error": format!("Failed to send voice message via Telegram: {}", e),
+        })
+        .to_string()),
+    }
+}
+
+async fn execute_send_message(bot: &Bot, args: &Value) -> Result<String> {
+    let chat_id = args["chat_id"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid 'chat_id'"))?;
+    let text = args["text"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'text'"))?;
+
+    if text.trim().is_empty() {
+        return Ok(json!({"error": "Text cannot be empty"}).to_string());
+    }
+    if text.len() > 4096 {
+        return Ok(json!(
+            {"error": "Text is too long for Telegram messages. Maximum is 4096 characters."}
+        )
+        .to_string());
+    }
+
+    match bot.send_message(ChatId(chat_id), text).await {
+        Ok(_) => Ok(json!({
+            "success": true,
+            "message": "Message sent",
+            "chat_id": chat_id,
+        })
+        .to_string()),
+        Err(e) => Ok(json!({
+            "error": format!("Failed to send message via Telegram: {}", e),
+            "chat_id": chat_id,
         })
         .to_string()),
     }

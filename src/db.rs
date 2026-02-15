@@ -509,30 +509,6 @@ pub async fn clear_important_memory(pool: &SqlitePool, segment: &str) -> Result<
     Ok(result.rows_affected() > 0)
 }
 
-// --- Notes ---
-
-pub async fn note_create(
-    pool: &SqlitePool,
-    segment: &str,
-    title: &str,
-    content: &str,
-    tags: &str,
-) -> Result<i64> {
-    let result =
-        sqlx::query("INSERT INTO notes (segment, title, content, tags) VALUES (?, ?, ?, ?)")
-            .bind(segment)
-            .bind(title)
-            .bind(content)
-            .bind(tags)
-            .execute(pool)
-            .await?;
-    let id = result.last_insert_rowid();
-
-    tracing::info!(id, segment, title, tags, "Note saved to DB");
-
-    Ok(id)
-}
-
 pub async fn note_read(pool: &SqlitePool, note_id: i64) -> Result<Option<NoteRow>> {
     let row = sqlx::query(
         "SELECT id, segment, title, content, tags, created_at, updated_at FROM notes WHERE id = ?",
@@ -550,14 +526,6 @@ pub async fn note_read(pool: &SqlitePool, note_id: i64) -> Result<Option<NoteRow
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
     }))
-}
-
-pub async fn note_delete(pool: &SqlitePool, note_id: i64) -> Result<bool> {
-    let result = sqlx::query("DELETE FROM notes WHERE id = ?")
-        .bind(note_id)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected() > 0)
 }
 
 pub async fn note_search(
@@ -699,28 +667,6 @@ pub async fn memory_get(pool: &SqlitePool, segment: &str, key: &str) -> Result<O
     Ok(row.map(|r| r.0))
 }
 
-pub async fn memory_list(pool: &SqlitePool, segment: &str) -> Result<Vec<MemoryRow>> {
-    let rows = sqlx::query(
-        "SELECT id, segment, key, value, created_at, updated_at FROM memory
-         WHERE segment = ? ORDER BY key",
-    )
-    .bind(segment)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .iter()
-        .map(|r| MemoryRow {
-            id: r.get("id"),
-            segment: r.get("segment"),
-            key: r.get("key"),
-            value: r.get("value"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        })
-        .collect())
-}
-
 pub async fn memory_list_filtered(
     pool: &SqlitePool,
     segments: Option<&[String]>,
@@ -732,8 +678,14 @@ pub async fn memory_list_filtered(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<MemoryRow>> {
-    let (where_sql, binds) =
-        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
+    let (where_sql, binds) = build_memory_filter_sql(
+        segments,
+        segment_like,
+        key,
+        key_prefix,
+        key_contains,
+        value_contains,
+    );
     let sql = format!(
         "SELECT id, segment, key, value, created_at, updated_at FROM memory WHERE 1=1{} ORDER BY segment ASC, key ASC LIMIT ? OFFSET ?",
         where_sql
@@ -769,17 +721,26 @@ pub async fn memory_count_filtered(
     key_contains: Option<&str>,
     value_contains: Option<&str>,
 ) -> Result<i64> {
-    let (where_sql, binds) =
-        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
-    let sql = format!("SELECT COUNT(*) AS count FROM memory WHERE 1=1{}", where_sql);
+    let (where_sql, binds) = build_memory_filter_sql(
+        segments,
+        segment_like,
+        key,
+        key_prefix,
+        key_contains,
+        value_contains,
+    );
+    let sql = format!(
+        "SELECT COUNT(*) AS count FROM memory WHERE 1=1{}",
+        where_sql
+    );
 
-    let mut query = sqlx::query(&sql);
+    let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for bind in &binds {
         query = query.bind(bind);
     }
 
-    let row: (i64,) = query.fetch_one(pool).await?.try_get("count")?;
-    Ok(row.0)
+    let count = query.fetch_one(pool).await?;
+    Ok(count)
 }
 
 pub async fn memory_delete(pool: &SqlitePool, segment: &str, key: &str) -> Result<u64> {
@@ -800,8 +761,14 @@ pub async fn memory_delete_filtered(
     key_contains: Option<&str>,
     value_contains: Option<&str>,
 ) -> Result<u64> {
-    let (where_sql, binds) =
-        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
+    let (where_sql, binds) = build_memory_filter_sql(
+        segments,
+        segment_like,
+        key,
+        key_prefix,
+        key_contains,
+        value_contains,
+    );
     let sql = format!("DELETE FROM memory WHERE 1=1{}", where_sql);
 
     let mut query = sqlx::query(&sql);
