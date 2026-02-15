@@ -608,6 +608,71 @@ pub async fn note_search(
 
 // --- Memory ---
 
+fn build_memory_filter_sql(
+    segments: Option<&[String]>,
+    segment_like: Option<&str>,
+    key: Option<&str>,
+    key_prefix: Option<&str>,
+    key_contains: Option<&str>,
+    value_contains: Option<&str>,
+) -> (String, Vec<String>) {
+    let mut sql = String::new();
+    let mut binds: Vec<String> = Vec::new();
+
+    if let Some(list) = segments {
+        if !list.is_empty() {
+            let placeholders = std::iter::repeat("?")
+                .take(list.len())
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            sql.push_str(" AND segment IN (");
+            sql.push_str(&placeholders);
+            sql.push(')');
+            for segment in list {
+                binds.push(segment.clone());
+            }
+        }
+    }
+
+    if let Some(like) = segment_like {
+        if !like.is_empty() {
+            sql.push_str(" AND segment LIKE ?");
+            binds.push(format!("%{}%", like));
+        }
+    }
+
+    if let Some(key) = key {
+        if !key.is_empty() {
+            sql.push_str(" AND key = ?");
+            binds.push(key.to_string());
+        }
+    }
+
+    if let Some(prefix) = key_prefix {
+        if !prefix.is_empty() {
+            sql.push_str(" AND key LIKE ?");
+            binds.push(format!("{}%", prefix));
+        }
+    }
+
+    if let Some(substr) = key_contains {
+        if !substr.is_empty() {
+            sql.push_str(" AND key LIKE ?");
+            binds.push(format!("%{}%", substr));
+        }
+    }
+
+    if let Some(substr) = value_contains {
+        if !substr.is_empty() {
+            sql.push_str(" AND value LIKE ?");
+            binds.push(format!("%{}%", substr));
+        }
+    }
+
+    (sql, binds)
+}
+
 pub async fn memory_set(pool: &SqlitePool, segment: &str, key: &str, value: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO memory (segment, key, value) VALUES (?, ?, ?)
@@ -654,6 +719,98 @@ pub async fn memory_list(pool: &SqlitePool, segment: &str) -> Result<Vec<MemoryR
             updated_at: r.get("updated_at"),
         })
         .collect())
+}
+
+pub async fn memory_list_filtered(
+    pool: &SqlitePool,
+    segments: Option<&[String]>,
+    segment_like: Option<&str>,
+    key: Option<&str>,
+    key_prefix: Option<&str>,
+    key_contains: Option<&str>,
+    value_contains: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<MemoryRow>> {
+    let (where_sql, binds) =
+        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
+    let sql = format!(
+        "SELECT id, segment, key, value, created_at, updated_at FROM memory WHERE 1=1{} ORDER BY segment ASC, key ASC LIMIT ? OFFSET ?",
+        where_sql
+    );
+
+    let mut query = sqlx::query(&sql);
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+    query = query.bind(limit).bind(offset);
+
+    let rows = query.fetch_all(pool).await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| MemoryRow {
+            id: r.get("id"),
+            segment: r.get("segment"),
+            key: r.get("key"),
+            value: r.get("value"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        })
+        .collect())
+}
+
+pub async fn memory_count_filtered(
+    pool: &SqlitePool,
+    segments: Option<&[String]>,
+    segment_like: Option<&str>,
+    key: Option<&str>,
+    key_prefix: Option<&str>,
+    key_contains: Option<&str>,
+    value_contains: Option<&str>,
+) -> Result<i64> {
+    let (where_sql, binds) =
+        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
+    let sql = format!("SELECT COUNT(*) AS count FROM memory WHERE 1=1{}", where_sql);
+
+    let mut query = sqlx::query(&sql);
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+
+    let row: (i64,) = query.fetch_one(pool).await?.try_get("count")?;
+    Ok(row.0)
+}
+
+pub async fn memory_delete(pool: &SqlitePool, segment: &str, key: &str) -> Result<u64> {
+    let result = sqlx::query("DELETE FROM memory WHERE segment = ? AND key = ?")
+        .bind(segment)
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn memory_delete_filtered(
+    pool: &SqlitePool,
+    segments: Option<&[String]>,
+    segment_like: Option<&str>,
+    key: Option<&str>,
+    key_prefix: Option<&str>,
+    key_contains: Option<&str>,
+    value_contains: Option<&str>,
+) -> Result<u64> {
+    let (where_sql, binds) =
+        build_memory_filter_sql(segments, segment_like, key, key_prefix, key_contains, value_contains);
+    let sql = format!("DELETE FROM memory WHERE 1=1{}", where_sql);
+
+    let mut query = sqlx::query(&sql);
+    for bind in &binds {
+        query = query.bind(bind);
+    }
+
+    let result = query.execute(pool).await?;
+    Ok(result.rows_affected())
 }
 
 // --- Tool Call Log ---

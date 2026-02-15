@@ -170,6 +170,90 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["segment"]
             }),
         ),
+        tool(
+            "unified_memory",
+            "Unified memory CRUD with fine-grained filters and multi-segment operations.\n\
+             Actions:\n\
+             - set: create/update one or many entries in one call\n\
+             - get: read a single value by exact segment+key\n\
+             - list: list entries with optional filters\n\
+             - delete: remove entries by exact segment+key, or filtered bulk delete (requires confirm: true)\n\
+             Segment formats: 'global', 'bot', 'chat:{chat_id}', 'person:{user_id}'.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set", "get", "list", "delete"]
+                    },
+                    "segment": {
+                        "type": "string",
+                        "description": "Target segment for exact operations (set/get/delete)."
+                    },
+                    "segments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional explicit list of segments for list/delete."
+                    },
+                    "segment_like": {
+                        "type": "string",
+                        "description": "Optional segment filter (substring). Example: 'chat:' to match all chat segments."
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Exact key for set/get/delete."
+                    },
+                    "key_prefix": {
+                        "type": "string",
+                        "description": "Match keys by prefix (list/delete)."
+                    },
+                    "key_contains": {
+                        "type": "string",
+                        "description": "Match keys containing this text (list/delete)."
+                    },
+                    "value_contains": {
+                        "type": "string",
+                        "description": "Match values containing this text (list/delete)."
+                    },
+                    "entries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "segment": {
+                                    "type": "string"
+                                },
+                                "key": {
+                                    "type": "string"
+                                },
+                                "value": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": ["segment", "key", "value"]
+                        },
+                        "description": "One or more memory entries for set action."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Value for set action when using single segment+key."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results for list. Default: 50, max: 500."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "List pagination offset. Default: 0."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Set true for bulk delete operations (more than one entry or no exact key)."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ),
         // --- MCP Servers (CRUD) ---
         tool(
             "crud_mcp_server",
@@ -894,6 +978,7 @@ pub async fn execute(
         "memory_set" => execute_memory_set(pool, rag, &args).await,
         "memory_get" => execute_memory_get(pool, &args).await,
         "memory_list" => execute_memory_list(pool, &args).await,
+        "unified_memory" => execute_unified_memory(pool, rag, &args).await,
         "crud_file" => execute_crud_file(pool, &args).await,
         "crud_mcp_server" => execute_crud_mcp_server(pool, &args, user_id).await,
         // Backward-compatible aliases (if model still calls old tool names)
@@ -1110,6 +1195,213 @@ async fn execute_memory_list(pool: &SqlitePool, args: &Value) -> Result<String> 
         .collect();
     let count = items.len();
     Ok(json!({"segment": segment, "entries": items, "count": count}).to_string())
+}
+
+async fn execute_unified_memory(pool: &SqlitePool, rag: &RagEngine, args: &Value) -> Result<String> {
+    let action = args["action"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'action'"))?
+        .to_lowercase();
+
+    let segment = args["segment"].as_str();
+    let segments = parse_segment_list(args.get("segments"), segment)?;
+    let segment_like = args["segment_like"].as_str();
+    let key = args["key"].as_str();
+    let key_prefix = args["key_prefix"].as_str();
+    let key_contains = args["key_contains"].as_str();
+    let value_contains = args["value_contains"].as_str();
+    let confirm = args["confirm"].as_bool().unwrap_or(false);
+
+    let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 500);
+    let offset = args["offset"].as_i64().unwrap_or(0).max(0);
+
+    match action.as_str() {
+        "set" => {
+            let entries = args.get("entries");
+            let mut written = Vec::new();
+
+            if let Some(entries) = entries {
+                let entries = entries.as_array().ok_or_else(|| {
+                    anyhow::anyhow!("'entries' must be an array for set action")
+                })?;
+
+                if entries.is_empty() {
+                    anyhow::bail!("'entries' cannot be empty");
+                }
+
+                for raw_entry in entries {
+                    let segment = raw_entry["segment"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Each entry requires 'segment'"))?;
+                    let key = raw_entry["key"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Each entry requires 'key'"))?;
+                    let value = raw_entry["value"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Each entry requires 'value'"))?;
+
+                    memory::set(pool, segment, key, value).await?;
+                    index_memory(pool, rag, segment, key, value).await?;
+                    written.push(json!({"segment": segment, "key": key, "value": value}));
+                }
+            } else {
+                let segment = segment.ok_or_else(|| anyhow::anyhow!("Set requires 'segment'"))?;
+                let key = key.ok_or_else(|| anyhow::anyhow!("Set requires 'key'"))?;
+                let value = args["value"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Set requires 'value'"))?;
+
+                memory::set(pool, segment, key, value).await?;
+                index_memory(pool, rag, segment, key, value).await?;
+                written.push(json!({"segment": segment, "key": key, "value": value}));
+            }
+
+            Ok(json!({
+                "action": "set",
+                "written": written.len(),
+                "entries": written,
+            })
+            .to_string())
+        }
+        "get" => {
+            let segment = segment.ok_or_else(|| anyhow::anyhow!("Get requires 'segment'"))?;
+            let key = key.ok_or_else(|| anyhow::anyhow!("Get requires 'key'"))?;
+
+            match memory::get(pool, segment, key).await? {
+                Some(value) => Ok(json!({"segment": segment, "key": key, "value": value}).to_string()),
+                None => Ok(json!({"segment": segment, "key": key, "value": null, "message": "Key not found"}).to_string()),
+            }
+        }
+        "list" => {
+            let entries = db::memory_list_filtered(
+                pool,
+                segments.as_deref(),
+                segment_like,
+                key,
+                key_prefix,
+                key_contains,
+                value_contains,
+                limit,
+                offset,
+            )
+            .await?;
+
+            let items: Vec<_> = entries
+                .iter()
+                .map(|m| {
+                    json!({
+                        "segment": m.segment,
+                        "key": m.key,
+                        "value": m.value,
+                        "updated_at": m.updated_at,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "action": "list",
+                "limit": limit,
+                "offset": offset,
+                "count": items.len(),
+                "entries": items,
+            })
+            .to_string())
+        }
+        "delete" => {
+            if let (Some(segment), Some(key)) = (segment, key) {
+                let deleted = db::memory_delete(pool, segment, key).await?;
+                return Ok(json!({
+                    "action": "delete",
+                    "segment": segment,
+                    "key": key,
+                    "deleted": deleted,
+                })
+                .to_string());
+            }
+
+            let has_filters =
+                segments.is_some() || segment_like.is_some() || key.is_some() || key_prefix.is_some()
+                    || key_contains.is_some()
+                    || value_contains.is_some();
+            if !has_filters {
+                anyhow::bail!("Delete requires segment+key or at least one filter");
+            }
+
+            if !confirm {
+                anyhow::bail!("Filtered delete requires confirm=true");
+            }
+
+            let deleted = db::memory_delete_filtered(
+                pool,
+                segments.as_deref(),
+                segment_like,
+                key,
+                key_prefix,
+                key_contains,
+                value_contains,
+            )
+            .await?;
+
+            Ok(json!({
+                "action": "delete",
+                "deleted": deleted,
+                "filters": {
+                    "segment": segment,
+                    "segments": segments,
+                    "segment_like": segment_like,
+                    "key_prefix": key_prefix,
+                    "key_contains": key_contains,
+                    "value_contains": value_contains,
+                },
+            })
+            .to_string())
+        }
+        _ => {
+            anyhow::bail!("Unsupported action '{}'. Use one of: set, get, list, delete", action)
+        }
+    }
+}
+
+async fn index_memory(pool: &SqlitePool, rag: &RagEngine, segment: &str, key: &str, value: &str) -> Result<()> {
+    if let Ok(Some((mem_id,))) =
+        sqlx::query_as::<_, (i64, )>("SELECT id FROM memory WHERE segment = ? AND key = ?")
+            .bind(segment)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+    {
+        let embed_text = format!("{}: {}", key, value);
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = rag.index_record_sync("memory", mem_id, 0, segment, &embed_text, "", &now);
+    }
+    Ok(())
+}
+
+fn parse_segment_list(segments_arg: Option<&Value>, single_segment: Option<&str>) -> Result<Option<Vec<String>>> {
+    let mut segments = Vec::new();
+
+    if let Some(segment) = single_segment {
+        memory::validate_segment(segment)?;
+        segments.push(segment.to_string());
+    }
+
+    if let Some(raw) = segments_arg {
+        let arr = raw
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("'segments' must be an array"))?;
+        for item in arr {
+            let segment = item
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Every segments item must be a string"))?;
+            memory::validate_segment(segment)?;
+            segments.push(segment.to_string());
+        }
+    }
+
+    if segments.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(segments))
+    }
 }
 
 fn with_action(args: &Value, action: &str) -> Value {
