@@ -1,0 +1,16 @@
+/target/
+/logs/
+/rag_data/
+*.db
+*.db-shm
+*.db-wal
+/KEY
+/TGTOKEN
+/node_modules/
+/dist/
+/tmp/
+*.log
+/.idea/
+/.vscode/
+*.swp
+*.swo
