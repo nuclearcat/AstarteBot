@@ -1,7 +1,7 @@
 use anyhow::Result;
+use serde_json::Value;
 use sqlx::SqlitePool;
 use std::time::{Duration, Instant};
-use serde_json::Value;
 use teloxide::Bot;
 
 use crate::mcp::McpManager;
@@ -72,9 +72,10 @@ impl LlmClient {
                 return Err(anyhow::anyhow!("OpenRouter error: {}", err.message));
             }
 
-            let choices = response.choices.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("No choices in OpenRouter response")
-            })?;
+            let choices = response
+                .choices
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("No choices in OpenRouter response"))?;
 
             if choices.is_empty() {
                 return Err(anyhow::anyhow!("Empty choices in OpenRouter response"));
@@ -136,7 +137,8 @@ impl LlmClient {
                         if let Some(error_msg) = error {
                             let signature = format!("{}|{}", tc.function.name, args_signature);
                             if Some(&signature) == last_tool_error_signature.as_ref() {
-                                repeated_tool_error_count = repeated_tool_error_count.saturating_add(1);
+                                repeated_tool_error_count =
+                                    repeated_tool_error_count.saturating_add(1);
                             } else {
                                 repeated_tool_error_count = 1;
                                 last_tool_error_signature = Some(signature);
@@ -194,7 +196,11 @@ impl LlmClient {
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-                tracing::warn!(attempt, delay_ms = delay.as_millis(), "Retrying OpenRouter request");
+                tracing::warn!(
+                    attempt,
+                    delay_ms = delay.as_millis(),
+                    "Retrying OpenRouter request"
+                );
                 tokio::time::sleep(delay).await;
             }
 
@@ -215,7 +221,10 @@ impl LlmClient {
 
                     if status.is_success() {
                         let body = resp.text().await?;
-                        tracing::debug!(latency_ms = latency.as_millis(), "OpenRouter response received");
+                        tracing::debug!(
+                            latency_ms = latency.as_millis(),
+                            "OpenRouter response received"
+                        );
 
                         match serde_json::from_str::<ChatResponse>(&body) {
                             Ok(parsed) => return Ok(parsed),
@@ -246,7 +255,5 @@ impl LlmClient {
 
 fn parse_tool_error_message(result: &str) -> Option<String> {
     let json = serde_json::from_str::<Value>(result).ok()?;
-    json.get("error")?
-        .as_str()
-        .map(|s| s.to_string())
+    json.get("error")?.as_str().map(|s| s.to_string())
 }

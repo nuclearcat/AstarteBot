@@ -102,15 +102,16 @@ unsafe impl Sync for RagEngine {}
 impl RagEngine {
     pub async fn init(data_dir: &Path) -> Result<Self> {
         let data_dir = data_dir.to_path_buf();
-        std::fs::create_dir_all(&data_dir)
-            .context("Failed to create RAG data directory")?;
+        std::fs::create_dir_all(&data_dir).context("Failed to create RAG data directory")?;
 
         // Download model files via hf-hub (cached after first download)
         let (model_path, tokenizer_path) = {
             spawn_blocking(move || -> Result<(PathBuf, PathBuf)> {
                 let api = hf_hub::api::sync::Api::new()
                     .context("Failed to create HuggingFace API client")?;
-                let repo = api.model("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2".to_string());
+                let repo = api.model(
+                    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2".to_string(),
+                );
                 let model_path = repo
                     .get("onnx/model.onnx")
                     .context("Failed to download model.onnx")?;
@@ -126,10 +127,9 @@ impl RagEngine {
 
         // Load ONNX model (CPU-bound)
         let mp = model_path.clone();
-        let model = spawn_blocking(move || {
-            candle_onnx::read_file(mp).context("Failed to load ONNX model")
-        })
-        .await??;
+        let model =
+            spawn_blocking(move || candle_onnx::read_file(mp).context("Failed to load ONNX model"))
+                .await??;
 
         // Load tokenizer
         let tp = tokenizer_path.clone();
@@ -143,14 +143,11 @@ impl RagEngine {
         let rocks_path = data_dir.join("rocksdb");
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        let meta_db = rocksdb::DB::open(&opts, &rocks_path)
-            .context("Failed to open RocksDB")?;
+        let meta_db = rocksdb::DB::open(&opts, &rocks_path).context("Failed to open RocksDB")?;
 
         // Load next_vector_id from RocksDB
         let next_id = match meta_db.get(b"__next_vector_id__")? {
-            Some(bytes) if bytes.len() == 8 => {
-                i64::from_le_bytes(bytes[..8].try_into().unwrap())
-            }
+            Some(bytes) if bytes.len() == 8 => i64::from_le_bytes(bytes[..8].try_into().unwrap()),
             _ => 0,
         };
 
@@ -201,12 +198,18 @@ impl RagEngine {
             device,
         )?;
         let mask_tensor = candle_core::Tensor::from_vec(
-            attention_mask.iter().map(|&x| x as i64).collect::<Vec<i64>>(),
+            attention_mask
+                .iter()
+                .map(|&x| x as i64)
+                .collect::<Vec<i64>>(),
             (1, seq_len),
             device,
         )?;
         let type_tensor = candle_core::Tensor::from_vec(
-            token_type_ids.iter().map(|&x| x as i64).collect::<Vec<i64>>(),
+            token_type_ids
+                .iter()
+                .map(|&x| x as i64)
+                .collect::<Vec<i64>>(),
             (1, seq_len),
             device,
         )?;
@@ -230,7 +233,10 @@ impl RagEngine {
         // Mean pooling with attention mask
         let hidden = hidden.squeeze(0)?; // [seq_len, 384]
         let mask_f32 = candle_core::Tensor::from_vec(
-            attention_mask.iter().map(|&x| x as f32).collect::<Vec<f32>>(),
+            attention_mask
+                .iter()
+                .map(|&x| x as f32)
+                .collect::<Vec<f32>>(),
             (seq_len, 1),
             device,
         )?;
@@ -242,11 +248,7 @@ impl RagEngine {
         let pooled = summed.broadcast_div(&mask_sum)?; // [384]
 
         // L2 normalize
-        let norm = pooled
-            .sqr()?
-            .sum_all()?
-            .sqrt()?
-            .to_scalar::<f32>()?;
+        let norm = pooled.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
 
         let normalized = if norm > 0.0 {
             (pooled / norm as f64)?
@@ -327,10 +329,7 @@ impl RagEngine {
 
         // Store raw vector bytes
         let raw_key = format!("raw:{}", vector_id);
-        let raw_bytes: Vec<u8> = embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let raw_bytes: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.meta_db.put(raw_key.as_bytes(), &raw_bytes)?;
 
         // Store dedup key
@@ -424,7 +423,8 @@ impl RagEngine {
         {
             let mut next = self.next_vector_id.lock().unwrap();
             *next = 0;
-            self.meta_db.put(b"__next_vector_id__", 0i64.to_le_bytes())?;
+            self.meta_db
+                .put(b"__next_vector_id__", 0i64.to_le_bytes())?;
         }
 
         // Clear all RocksDB keys

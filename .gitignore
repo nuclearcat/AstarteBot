@@ -1,6 +1,7 @@
 /target/
 /logs/
 /rag_data/
+/files/
 *.db
 *.db-shm
 *.db-wal

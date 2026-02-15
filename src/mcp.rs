@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout;
 
@@ -175,8 +175,14 @@ impl McpManager {
     pub async fn discover_tools(&self, server_name: &str) -> Result<Vec<McpToolInfo>> {
         let conn_arc = {
             let conns = self.connections.read().await;
-            conns.get(server_name)
-                .ok_or_else(|| anyhow::anyhow!("Not connected to '{}'. Call ensure_connected first.", server_name))?
+            conns
+                .get(server_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Not connected to '{}'. Call ensure_connected first.",
+                        server_name
+                    )
+                })?
                 .clone()
         };
 
@@ -195,9 +201,8 @@ impl McpManager {
         }
 
         let tools_value = response.result.unwrap_or(json!({}));
-        let tools: Vec<McpToolInfo> = serde_json::from_value(
-            tools_value.get("tools").cloned().unwrap_or(json!([]))
-        )?;
+        let tools: Vec<McpToolInfo> =
+            serde_json::from_value(tools_value.get("tools").cloned().unwrap_or(json!([])))?;
 
         conn.cached_tools = Some(tools.clone());
         Ok(tools)
@@ -224,7 +229,8 @@ impl McpManager {
 
         let conn_arc = {
             let conns = self.connections.read().await;
-            conns.get(server_name)
+            conns
+                .get(server_name)
                 .ok_or_else(|| anyhow::anyhow!("Not connected to '{}'", server_name))?
                 .clone()
         };
@@ -367,9 +373,8 @@ async fn run_handshake(
     }
 
     let tools_value = list_resp.result.unwrap_or(json!({}));
-    let tools: Vec<McpToolInfo> = serde_json::from_value(
-        tools_value.get("tools").cloned().unwrap_or(json!([]))
-    )?;
+    let tools: Vec<McpToolInfo> =
+        serde_json::from_value(tools_value.get("tools").cloned().unwrap_or(json!([])))?;
 
     tracing::info!(count = tools.len(), "MCP tools discovered");
     Ok(tools)
@@ -383,11 +388,9 @@ async fn send_rpc(
     request: &JsonRpcRequest,
 ) -> Result<JsonRpcResponse> {
     match conn.transport.as_str() {
-        "tcp" => {
-            timeout(REQUEST_TIMEOUT, tcp_send_recv(conn, request))
-                .await
-                .context("MCP TCP request timeout (30s)")?
-        }
+        "tcp" => timeout(REQUEST_TIMEOUT, tcp_send_recv(conn, request))
+            .await
+            .context("MCP TCP request timeout (30s)")?,
         "http" | "sse" | "streamable_http" => {
             http_rpc_with_retry(http_client, &conn.endpoint, request).await
         }
@@ -461,8 +464,7 @@ async fn tcp_read_response(reader: &mut BufReader<OwnedReadHalf>) -> Result<Json
             .context(format!("Invalid JSON from MCP server: {}", trimmed))?;
 
         // Skip server-initiated notifications (have "method" but no "id")
-        if parsed.get("method").is_some()
-            && (parsed.get("id").is_none() || parsed["id"].is_null())
+        if parsed.get("method").is_some() && (parsed.get("id").is_none() || parsed["id"].is_null())
         {
             tracing::debug!(
                 method = %parsed["method"],
@@ -488,7 +490,11 @@ async fn http_rpc_with_retry(
     for attempt in 0..HTTP_MAX_RETRIES {
         if attempt > 0 {
             let delay = Duration::from_millis(500 * 2u64.pow(attempt));
-            tracing::warn!(attempt, delay_ms = delay.as_millis(), "Retrying MCP HTTP request");
+            tracing::warn!(
+                attempt,
+                delay_ms = delay.as_millis(),
+                "Retrying MCP HTTP request"
+            );
             tokio::time::sleep(delay).await;
         }
 
@@ -497,8 +503,10 @@ async fn http_rpc_with_retry(
                 let status = resp.status();
                 if status.is_success() {
                     let body = resp.text().await?;
-                    return serde_json::from_str(&body)
-                        .context(format!("Invalid JSON-RPC response from MCP server: {}", body));
+                    return serde_json::from_str(&body).context(format!(
+                        "Invalid JSON-RPC response from MCP server: {}",
+                        body
+                    ));
                 } else if status.is_server_error() {
                     let body = resp.text().await.unwrap_or_default();
                     tracing::warn!(status = status.as_u16(), body = %body, "MCP HTTP server error");

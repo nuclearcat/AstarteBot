@@ -1,6 +1,6 @@
 use anyhow::Result;
 use tracing_appender::rolling;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init(log_dir: &str) -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -20,6 +20,9 @@ pub fn init(log_dir: &str) -> Result<()> {
         .with(file_layer)
         .init();
 
-    tracing::info!("Logging initialized (console + file: {}/astartebot.log)", log_dir);
+    tracing::info!(
+        "Logging initialized (console + file: {}/astartebot.log)",
+        log_dir
+    );
     Ok(())
 }

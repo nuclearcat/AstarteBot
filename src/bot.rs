@@ -30,12 +30,8 @@ struct BotState {
 pub async fn run(pool: SqlitePool) -> Result<()> {
     let tg_token = config::get_telegram_token(&pool).await?;
     let llm_token = config::get_required(&pool, "llm_token").await?;
-    let llm_model = config::get_or_default(
-        &pool,
-        "llm_model",
-        "anthropic/claude-sonnet-4-5-20250929",
-    )
-    .await?;
+    let llm_model =
+        config::get_or_default(&pool, "llm_model", "anthropic/claude-sonnet-4-5-20250929").await?;
     let bot_name = config::get_or_default(&pool, "bot_name", "Astarte").await?;
     let system_prompt = config::get_or_default(
         &pool,
@@ -53,6 +49,10 @@ pub async fn run(pool: SqlitePool) -> Result<()> {
             - `http://...` / `https://...` => transport inferred as http\n\
             - explicit `transport='stdio'` => requires non-empty command\n\
             - explicit `transport='http'`/`sse`/`streamable_http` => requires non-empty endpoint URL.\n\
+            You can manage files via `crud_file` with actions: create/read/list/update/delete. File operations are restricted to the `files` directory by default (or `config set files_root <path>` to override). \
+            Use `read` with `offset` (0-based) and optional `line_count` (default 200) for paging. \
+            Use `update` with `mode` (`replace`, `insert`, `delete`, `append`), and optional `offset`/`line_count` for patch-style updates. \
+            `offset` defaults to 0 when meaningful; `line_count` defaults to 1 for partial replace/delete and 200 for read. File paths must be relative and cannot include path traversal segments.\n\
             If required fields are missing, do not call the tool; ask the user for the missing fields instead.",
             bot_name
         ),
@@ -92,6 +92,9 @@ pub async fn run(pool: SqlitePool) -> Result<()> {
         trigger_keywords,
     });
 
+    // Start hourly background backups
+    let _backup_handle = crate::backup::start_hourly_backup();
+
     let handler = Update::filter_message().endpoint(handle_message);
 
     Dispatcher::builder(bot, handler)
@@ -105,7 +108,11 @@ pub async fn run(pool: SqlitePool) -> Result<()> {
     Ok(())
 }
 
-async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_message(
+    bot: Bot,
+    msg: Message,
+    state: Arc<BotState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let user = msg.from.as_ref();
     let user_id = user.map(|u| u.id.0 as i64).unwrap_or(0);
     let chat_id = msg.chat.id.0;
@@ -114,8 +121,13 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
     let reply_to_msg_id = msg.reply_to_message().map(|r| r.id.0 as i64);
 
     // Log received message
-    let is_voice = matches!(&msg.kind, MessageKind::Common(c) if matches!(&c.media_kind, MediaKind::Voice(_)));
-    let text_preview = if is_voice { "[voice message]" } else { msg.text().or(msg.caption()).unwrap_or("[non-text]") };
+    let is_voice =
+        matches!(&msg.kind, MessageKind::Common(c) if matches!(&c.media_kind, MediaKind::Voice(_)));
+    let text_preview = if is_voice {
+        "[voice message]"
+    } else {
+        msg.text().or(msg.caption()).unwrap_or("[non-text]")
+    };
     tracing::info!(
         chat_id,
         user_id,
@@ -138,13 +150,28 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
     // Log ALL text messages to conversation history (for searchable context)
     if let Some(text) = msg.text() {
         if let Ok(row_id) = db::conversation_save(
-            &state.pool, chat_id, user_id, &user_display_name,
-            "user", text, None, tg_message_id, reply_to_msg_id,
-        ).await {
+            &state.pool,
+            chat_id,
+            user_id,
+            &user_display_name,
+            "user",
+            text,
+            None,
+            tg_message_id,
+            reply_to_msg_id,
+        )
+        .await
+        {
             let segment = format!("chat:{}", chat_id);
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = state.rag.index_record_sync(
-                "conversation", row_id, chat_id, &segment, text, &user_display_name, &now,
+                "conversation",
+                row_id,
+                chat_id,
+                &segment,
+                text,
+                &user_display_name,
+                &now,
             );
         }
     }
@@ -153,8 +180,14 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
     if let Some(text) = msg.text() {
         let text_trimmed = text.trim();
         if text_trimmed == "/start" || text_trimmed == format!("/start@{}", state.bot_username) {
-            bot.send_message(msg.chat.id, format!("Hello! I'm {}. Send me a message and I'll do my best to help!", state.bot_name))
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Hello! I'm {}. Send me a message and I'll do my best to help!",
+                    state.bot_name
+                ),
+            )
+            .await?;
             return Ok(());
         }
         if text_trimmed == "/help" || text_trimmed == format!("/help@{}", state.bot_username) {
@@ -172,9 +205,17 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
             return Ok(());
         }
         if text_trimmed == "/reset" || text_trimmed == format!("/reset@{}", state.bot_username) {
-            let deleted = db::conversation_clear(&state.pool, msg.chat.id.0).await.unwrap_or(0);
-            bot.send_message(msg.chat.id, format!("Conversation history cleared ({} messages removed).", deleted))
-                .await?;
+            let deleted = db::conversation_clear(&state.pool, msg.chat.id.0)
+                .await
+                .unwrap_or(0);
+            bot.send_message(
+                msg.chat.id,
+                format!(
+                    "Conversation history cleared ({} messages removed).",
+                    deleted
+                ),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -208,22 +249,50 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
                 .join(" "),
         };
         if let Ok(row_id) = db::conversation_save(
-            &state.pool, chat_id, user_id, &user_display_name,
-            "user", &content_text, None, tg_message_id, reply_to_msg_id,
-        ).await {
+            &state.pool,
+            chat_id,
+            user_id,
+            &user_display_name,
+            "user",
+            &content_text,
+            None,
+            tg_message_id,
+            reply_to_msg_id,
+        )
+        .await
+        {
             let segment = format!("chat:{}", chat_id);
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             let _ = state.rag.index_record_sync(
-                "conversation", row_id, chat_id, &segment, &content_text, &user_display_name, &now,
+                "conversation",
+                row_id,
+                chat_id,
+                &segment,
+                &content_text,
+                &user_display_name,
+                &now,
             );
         }
     }
 
     // Build messages for LLM
-    let messages = build_llm_messages(&state, chat_id, user_id, tg_message_id, user_content).await?;
+    let messages =
+        build_llm_messages(&state, chat_id, user_id, tg_message_id, user_content).await?;
 
     // Call LLM
-    match state.llm.chat(&state.pool, &bot, &state.rag, &state.mcp, messages, chat_id, user_id).await {
+    match state
+        .llm
+        .chat(
+            &state.pool,
+            &bot,
+            &state.rag,
+            &state.mcp,
+            messages,
+            chat_id,
+            user_id,
+        )
+        .await
+    {
         Ok(response) => {
             if response.is_empty() {
                 return Ok(());
@@ -231,13 +300,28 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
 
             // Save assistant response to history
             if let Ok(row_id) = db::conversation_save(
-                &state.pool, chat_id, 0, &state.bot_name,
-                "assistant", &response, None, None, tg_message_id,
-            ).await {
+                &state.pool,
+                chat_id,
+                0,
+                &state.bot_name,
+                "assistant",
+                &response,
+                None,
+                None,
+                tg_message_id,
+            )
+            .await
+            {
                 let segment = format!("chat:{}", chat_id);
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
                 let _ = state.rag.index_record_sync(
-                    "conversation", row_id, chat_id, &segment, &response, &state.bot_name, &now,
+                    "conversation",
+                    row_id,
+                    chat_id,
+                    &segment,
+                    &response,
+                    &state.bot_name,
+                    &now,
                 );
             }
 
@@ -246,8 +330,11 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<BotState>) -> Result<
         }
         Err(e) => {
             tracing::error!(error = %e, chat_id, user_id, "LLM error");
-            bot.send_message(msg.chat.id, "Sorry, I encountered an error processing your message. Please try again.")
-                .await?;
+            bot.send_message(
+                msg.chat.id,
+                "Sorry, I encountered an error processing your message. Please try again.",
+            )
+            .await?;
         }
     }
 
@@ -302,7 +389,10 @@ fn should_respond(msg: &Message, state: &BotState) -> bool {
             if entity.kind == teloxide::types::MessageEntityKind::Mention {
                 if let Some(text) = entity_text {
                     if let Some(mention) = utf16_substr(text, entity.offset, entity.length) {
-                        if mention.trim_start_matches('@').eq_ignore_ascii_case(&state.bot_username) {
+                        if mention
+                            .trim_start_matches('@')
+                            .eq_ignore_ascii_case(&state.bot_username)
+                        {
                             return true;
                         }
                     }
@@ -341,31 +431,45 @@ async fn extract_content(bot: &Bot, msg: &Message, pool: &SqlitePool) -> Option<
 
         // Handle voice messages
         if let MediaKind::Voice(voice_media) = &common.media_kind {
-            let voice_mode = config::get_or_default(pool, "voice_mode", "auto").await.unwrap_or_else(|_| "auto".to_string());
+            let voice_mode = config::get_or_default(pool, "voice_mode", "auto")
+                .await
+                .unwrap_or_else(|_| "auto".to_string());
             // auto: use whisper if openai_api_key is set, otherwise openrouter
             let use_whisper = match voice_mode.as_str() {
                 "whisper" => true,
                 "openrouter" => false,
-                _ => config::get(pool, "openai_api_key").await.ok().flatten().is_some_and(|k| !k.is_empty()),
+                _ => config::get(pool, "openai_api_key")
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|k| !k.is_empty()),
             };
             if use_whisper {
                 // Whisper mode: transcribe first, then send text to LLM
                 match transcribe_voice(bot, pool, &voice_media.voice).await {
                     Ok(transcript) => {
                         let text = format!("[voice message, transcribed] {}", transcript);
-                        tracing::info!(transcript_len = transcript.len(), "Voice transcribed via Whisper");
+                        tracing::info!(
+                            transcript_len = transcript.len(),
+                            "Voice transcribed via Whisper"
+                        );
                         return Some(MessageContent::Text(text));
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Whisper transcription failed");
-                        return Some(MessageContent::Text("[voice message — transcription failed]".to_string()));
+                        return Some(MessageContent::Text(
+                            "[voice message — transcription failed]".to_string(),
+                        ));
                     }
                 }
             } else {
                 // OpenRouter mode: send audio directly to LLM (model must support audio)
                 match download_voice_as_base64(bot, &voice_media.voice).await {
                     Ok(audio_b64) => {
-                        tracing::info!(audio_size = audio_b64.len(), "Voice sent directly to LLM via OpenRouter");
+                        tracing::info!(
+                            audio_size = audio_b64.len(),
+                            "Voice sent directly to LLM via OpenRouter"
+                        );
                         let mut parts = vec![ContentPart::InputAudio {
                             input_audio: AudioInput {
                                 data: audio_b64,
@@ -379,7 +483,9 @@ async fn extract_content(bot: &Bot, msg: &Message, pool: &SqlitePool) -> Option<
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Failed to download voice for OpenRouter");
-                        return Some(MessageContent::Text("[voice message — download failed]".to_string()));
+                        return Some(MessageContent::Text(
+                            "[voice message — download failed]".to_string(),
+                        ));
                     }
                 }
             }
@@ -459,7 +565,11 @@ async fn transcribe_voice(bot: &Bot, pool: &SqlitePool, voice: &Voice) -> Result
     let status = response.status();
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_default();
-        return Err(anyhow::anyhow!("Whisper API error HTTP {}: {}", status, error_body));
+        return Err(anyhow::anyhow!(
+            "Whisper API error HTTP {}: {}",
+            status,
+            error_body
+        ));
     }
 
     let transcript = response.text().await?.trim().to_string();
@@ -489,7 +599,9 @@ async fn build_llm_messages(
             }
         });
 
-    let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
 
     // Build user identity string
     let user_identity = if user_tg_username.is_empty() {
@@ -509,7 +621,14 @@ async fn build_llm_messages(
          - Available memory segments for this context: global, bot, chat:{}, person:{}\n\
          - Voice: Messages prefixed with [voice message, transcribed] were spoken by the user (not typed). \
          You can reply with voice using the send_voice tool. When a user speaks to you, consider replying with voice too for a natural conversation.",
-        state.system_prompt, now, state.bot_name, chat_name, chat_id, user_identity, chat_id, user_id
+        state.system_prompt,
+        now,
+        state.bot_name,
+        chat_name,
+        chat_id,
+        user_identity,
+        chat_id,
+        user_id
     );
     system_text.push_str(
         "\n\nImportant MCP rules for `crud_mcp_server`:\n\
@@ -544,7 +663,10 @@ async fn build_llm_messages(
     // Inject person-specific pinned memory for the current user
     let person_segment = format!("person:{}", user_id);
     if let Ok(Some(important)) = db::get_important_memory(&state.pool, &person_segment).await {
-        system_text.push_str(&format!("\n\nPinned memory about current user ({}):\n{}", user_display, important));
+        system_text.push_str(&format!(
+            "\n\nPinned memory about current user ({}):\n{}",
+            user_display, important
+        ));
     }
 
     messages.push(ChatMessage {
@@ -577,7 +699,10 @@ async fn build_llm_messages(
                     } else {
                         &replied_to.user_name
                     };
-                    content.push_str(&format!(" (replying to {}: \"{}...\")", replied_name, reply_preview));
+                    content.push_str(&format!(
+                        " (replying to {}: \"{}...\")",
+                        replied_name, reply_preview
+                    ));
                 }
             }
             content.push_str(&format!(": {}", row.content));
@@ -661,11 +786,7 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
         // Try to split at a newline or space within the boundary
         let split_at = remaining[..boundary]
             .rfind('\n')
-            .unwrap_or_else(|| {
-                remaining[..boundary]
-                    .rfind(' ')
-                    .unwrap_or(boundary)
-            });
+            .unwrap_or_else(|| remaining[..boundary].rfind(' ').unwrap_or(boundary));
 
         let (chunk, rest) = remaining.split_at(split_at);
         chunks.push(chunk.to_string());

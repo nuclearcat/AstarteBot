@@ -1,3 +1,4 @@
+mod backup;
 mod bot;
 mod config;
 mod db;
@@ -29,7 +30,11 @@ fn mask_sensitive_value(value: &str) -> String {
 }
 
 #[derive(Parser)]
-#[command(name = "astartebot", version, about = "AstarteBot - Telegram AI Assistant")]
+#[command(
+    name = "astartebot",
+    version,
+    about = "AstarteBot - Telegram AI Assistant"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -189,8 +194,14 @@ async fn main() -> Result<()> {
                 RagAction::Test => {
                     println!("=== RAG Embedding Diagnostic ===\n");
                     let pairs: Vec<(&str, &str)> = vec![
-                        ("birthday celebration with cake and party", "Lera's birthday at Atlantis with a wonderful cake"),
-                        ("cooking Italian pasta with tomato sauce", "making spaghetti bolognese for dinner"),
+                        (
+                            "birthday celebration with cake and party",
+                            "Lera's birthday at Atlantis with a wonderful cake",
+                        ),
+                        (
+                            "cooking Italian pasta with tomato sauce",
+                            "making spaghetti bolognese for dinner",
+                        ),
                         ("cooking Italian pasta", "quantum physics lecture notes"),
                         ("Hello world", "Hello world"),
                         ("cats ginger and black", "рыжий кот и чёрная кошка"),
@@ -203,12 +214,21 @@ async fn main() -> Result<()> {
                         let norm_b: f32 = vb.iter().map(|x| x * x).sum::<f32>().sqrt();
                         println!("A: \"{}\"", a);
                         println!("B: \"{}\"", b);
-                        println!("  dot={:.6}  |a|={:.6}  |b|={:.6}  cosine={:.6}\n",
-                            dot, norm_a, norm_b, dot / (norm_a * norm_b));
+                        println!(
+                            "  dot={:.6}  |a|={:.6}  |b|={:.6}  cosine={:.6}\n",
+                            dot,
+                            norm_a,
+                            norm_b,
+                            dot / (norm_a * norm_b)
+                        );
                     }
                     let v = rag_engine.embed_text("Hello world")?;
                     println!("Embedding 'Hello world' first 10 dims: {:?}", &v[..10]);
-                    println!("Norm: {:.6}  Dim: {}", v.iter().map(|x| x*x).sum::<f32>().sqrt(), v.len());
+                    println!(
+                        "Norm: {:.6}  Dim: {}",
+                        v.iter().map(|x| x * x).sum::<f32>().sqrt(),
+                        v.len()
+                    );
                 }
             }
         }
@@ -232,7 +252,9 @@ async fn main() -> Result<()> {
                 TriggerAction::List => {
                     let keywords = db::trigger_keywords_list(&pool).await?;
                     if keywords.is_empty() {
-                        println!("No trigger keywords set. The bot will only respond to @mentions and replies in groups.");
+                        println!(
+                            "No trigger keywords set. The bot will only respond to @mentions and replies in groups."
+                        );
                     } else {
                         println!("Trigger keywords ({}):", keywords.len());
                         for kw in &keywords {

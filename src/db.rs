@@ -3,7 +3,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Column, Row, SqlitePool};
 use std::str::FromStr;
 
-use crate::types::{ConversationRow, MemoryRow, McpServerRow, NoteRow};
+use crate::types::{ConversationRow, McpServerRow, MemoryRow, NoteRow};
 
 pub async fn create_pool(db_path: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(db_path)?
@@ -29,22 +29,31 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    let current_version: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
-        .fetch_one(pool)
-        .await?;
+    let current_version: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(pool)
+            .await?;
 
     let migrations: Vec<(i64, &str)> = vec![
-        (1, "CREATE TABLE IF NOT EXISTS config (
+        (
+            1,
+            "CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        )"),
-        (2, "CREATE TABLE IF NOT EXISTS name_map (
+        )",
+        ),
+        (
+            2,
+            "CREATE TABLE IF NOT EXISTS name_map (
             entity_type TEXT NOT NULL,
             entity_id INTEGER NOT NULL,
             display_name TEXT NOT NULL,
             PRIMARY KEY (entity_type, entity_id)
-        )"),
-        (3, "CREATE TABLE IF NOT EXISTS memory (
+        )",
+        ),
+        (
+            3,
+            "CREATE TABLE IF NOT EXISTS memory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             segment TEXT NOT NULL,
             key TEXT NOT NULL,
@@ -52,8 +61,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(segment, key)
-        )"),
-        (4, "CREATE TABLE IF NOT EXISTS notes (
+        )",
+        ),
+        (
+            4,
+            "CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             segment TEXT NOT NULL,
             title TEXT NOT NULL,
@@ -61,8 +73,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             tags TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"),
-        (5, "CREATE TABLE IF NOT EXISTS conversation_history (
+        )",
+        ),
+        (
+            5,
+            "CREATE TABLE IF NOT EXISTS conversation_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
@@ -70,8 +85,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             content TEXT NOT NULL,
             tool_call_id TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"),
-        (6, "CREATE TABLE IF NOT EXISTS tool_call_log (
+        )",
+        ),
+        (
+            6,
+            "CREATE TABLE IF NOT EXISTS tool_call_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
@@ -79,21 +97,54 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             arguments TEXT NOT NULL,
             result TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"),
-        (7, "CREATE INDEX IF NOT EXISTS idx_conversation_chat ON conversation_history(chat_id, created_at)"),
-        (8, "CREATE INDEX IF NOT EXISTS idx_notes_segment ON notes(segment)"),
-        (9, "CREATE INDEX IF NOT EXISTS idx_memory_segment ON memory(segment)"),
-        (10, "ALTER TABLE conversation_history ADD COLUMN user_name TEXT NOT NULL DEFAULT ''"),
-        (11, "CREATE INDEX IF NOT EXISTS idx_conversation_user ON conversation_history(chat_id, user_id)"),
-        (12, "CREATE INDEX IF NOT EXISTS idx_conversation_content ON conversation_history(chat_id, content)"),
-        (13, "ALTER TABLE conversation_history ADD COLUMN reply_to_id INTEGER"),
-        (14, "ALTER TABLE conversation_history ADD COLUMN message_id INTEGER"),
-        (15, "ALTER TABLE name_map ADD COLUMN username TEXT NOT NULL DEFAULT ''"),
-        (16, "CREATE TABLE IF NOT EXISTS trigger_keywords (
+        )",
+        ),
+        (
+            7,
+            "CREATE INDEX IF NOT EXISTS idx_conversation_chat ON conversation_history(chat_id, created_at)",
+        ),
+        (
+            8,
+            "CREATE INDEX IF NOT EXISTS idx_notes_segment ON notes(segment)",
+        ),
+        (
+            9,
+            "CREATE INDEX IF NOT EXISTS idx_memory_segment ON memory(segment)",
+        ),
+        (
+            10,
+            "ALTER TABLE conversation_history ADD COLUMN user_name TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            11,
+            "CREATE INDEX IF NOT EXISTS idx_conversation_user ON conversation_history(chat_id, user_id)",
+        ),
+        (
+            12,
+            "CREATE INDEX IF NOT EXISTS idx_conversation_content ON conversation_history(chat_id, content)",
+        ),
+        (
+            13,
+            "ALTER TABLE conversation_history ADD COLUMN reply_to_id INTEGER",
+        ),
+        (
+            14,
+            "ALTER TABLE conversation_history ADD COLUMN message_id INTEGER",
+        ),
+        (
+            15,
+            "ALTER TABLE name_map ADD COLUMN username TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            16,
+            "CREATE TABLE IF NOT EXISTS trigger_keywords (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             keyword TEXT NOT NULL UNIQUE COLLATE NOCASE
-        )"),
-        (17, "CREATE TABLE IF NOT EXISTS mcp_servers (
+        )",
+        ),
+        (
+            17,
+            "CREATE TABLE IF NOT EXISTS mcp_servers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             description TEXT NOT NULL DEFAULT '',
@@ -107,7 +158,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             updated_by INTEGER,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )"),
+        )",
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -175,7 +227,11 @@ pub async fn name_map_set(
     Ok(())
 }
 
-pub async fn name_map_get(pool: &SqlitePool, entity_type: &str, entity_id: i64) -> Result<Option<String>> {
+pub async fn name_map_get(
+    pool: &SqlitePool,
+    entity_type: &str,
+    entity_id: i64,
+) -> Result<Option<String>> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT display_name FROM name_map WHERE entity_type = ? AND entity_id = ?")
             .bind(entity_type)
@@ -186,13 +242,18 @@ pub async fn name_map_get(pool: &SqlitePool, entity_type: &str, entity_id: i64) 
 }
 
 /// Get both display_name and username for an entity
-pub async fn name_map_get_full(pool: &SqlitePool, entity_type: &str, entity_id: i64) -> Result<Option<(String, String)>> {
-    let row: Option<(String, String)> =
-        sqlx::query_as("SELECT display_name, username FROM name_map WHERE entity_type = ? AND entity_id = ?")
-            .bind(entity_type)
-            .bind(entity_id)
-            .fetch_optional(pool)
-            .await?;
+pub async fn name_map_get_full(
+    pool: &SqlitePool,
+    entity_type: &str,
+    entity_id: i64,
+) -> Result<Option<(String, String)>> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT display_name, username FROM name_map WHERE entity_type = ? AND entity_id = ?",
+    )
+    .bind(entity_type)
+    .bind(entity_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row)
 }
 
@@ -239,7 +300,11 @@ pub async fn conversation_save(
     Ok(row_id)
 }
 
-pub async fn conversation_load(pool: &SqlitePool, chat_id: i64, limit: i64) -> Result<Vec<ConversationRow>> {
+pub async fn conversation_load(
+    pool: &SqlitePool,
+    chat_id: i64,
+    limit: i64,
+) -> Result<Vec<ConversationRow>> {
     let rows = sqlx::query(
         "SELECT id, chat_id, user_id, user_name, role, content, tool_call_id, message_id, reply_to_id, created_at
          FROM conversation_history
@@ -426,7 +491,10 @@ pub async fn get_important_memory(pool: &SqlitePool, segment: &str) -> Result<Op
 /// Set the "important" pinned memory for a segment (max 500 chars)
 pub async fn set_important_memory(pool: &SqlitePool, segment: &str, value: &str) -> Result<()> {
     if value.len() > 500 {
-        anyhow::bail!("Important memory is limited to 500 characters (got {})", value.len());
+        anyhow::bail!(
+            "Important memory is limited to 500 characters (got {})",
+            value.len()
+        );
     }
     let key = "__important__";
     memory_set(pool, segment, key, value).await
@@ -450,15 +518,14 @@ pub async fn note_create(
     content: &str,
     tags: &str,
 ) -> Result<i64> {
-    let result = sqlx::query(
-        "INSERT INTO notes (segment, title, content, tags) VALUES (?, ?, ?, ?)",
-    )
-    .bind(segment)
-    .bind(title)
-    .bind(content)
-    .bind(tags)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("INSERT INTO notes (segment, title, content, tags) VALUES (?, ?, ?, ?)")
+            .bind(segment)
+            .bind(title)
+            .bind(content)
+            .bind(tags)
+            .execute(pool)
+            .await?;
     let id = result.last_insert_rowid();
 
     tracing::info!(id, segment, title, tags, "Note saved to DB");
@@ -493,7 +560,11 @@ pub async fn note_delete(pool: &SqlitePool, note_id: i64) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn note_search(pool: &SqlitePool, query: &str, segment: Option<&str>) -> Result<Vec<NoteRow>> {
+pub async fn note_search(
+    pool: &SqlitePool,
+    query: &str,
+    segment: Option<&str>,
+) -> Result<Vec<NoteRow>> {
     let pattern = format!("%{}%", query);
 
     let rows = if let Some(seg) = segment {
@@ -612,9 +683,10 @@ pub async fn tool_call_log(
 // --- Trigger Keywords ---
 
 pub async fn trigger_keywords_list(pool: &SqlitePool) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT keyword FROM trigger_keywords ORDER BY keyword")
-        .fetch_all(pool)
-        .await?;
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT keyword FROM trigger_keywords ORDER BY keyword")
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
@@ -636,7 +708,10 @@ pub async fn trigger_keyword_remove(pool: &SqlitePool, keyword: &str) -> Result<
 
 // --- MCP Servers ---
 
-pub async fn mcp_server_list(pool: &SqlitePool, include_disabled: bool) -> Result<Vec<McpServerRow>> {
+pub async fn mcp_server_list(
+    pool: &SqlitePool,
+    include_disabled: bool,
+) -> Result<Vec<McpServerRow>> {
     let sql = if include_disabled {
         "SELECT id, name, description, transport, endpoint, command, args, environment, enabled, created_by, updated_by, created_at, updated_at
          FROM mcp_servers
@@ -812,7 +887,9 @@ pub async fn raw_modify(pool: &SqlitePool, sql: &str) -> Result<u64> {
     // Block modification of tg_bot_token via raw SQL
     let lower = sql.to_lowercase();
     if lower.contains("tg_bot_token") {
-        anyhow::bail!("Cannot modify tg_bot_token via raw SQL. Use 'astartebot config set tg_bot_token <value>' instead.");
+        anyhow::bail!(
+            "Cannot modify tg_bot_token via raw SQL. Use 'astartebot config set tg_bot_token <value>' instead."
+        );
     }
     let result = sqlx::query(sql).execute(pool).await?;
     Ok(result.rows_affected())

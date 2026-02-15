@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::SqlitePool;
 use teloxide::prelude::*;
 use teloxide::types::InputFile;
 
+use crate::config;
 use crate::db;
 use crate::mcp::McpManager;
 use crate::memory;
@@ -112,7 +114,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["note_id"]
             }),
         ),
-
         // --- Memory (key-value store) ---
         tool(
             "memory_set",
@@ -169,7 +170,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["segment"]
             }),
         ),
-
         // --- MCP Servers (CRUD) ---
         tool(
             "crud_mcp_server",
@@ -239,7 +239,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["action"]
             }),
         ),
-
         // --- Conversation History ---
         tool(
             "search_history",
@@ -297,7 +296,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["offset"]
             }),
         ),
-
         tool(
             "search_all_chats",
             "Search conversation history across ALL chats and groups at once. Unlike search_history (which only searches the current chat), this tool searches every chat the bot has ever participated in. Use this when:\n\
@@ -340,7 +338,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": []
             }),
         ),
-
         // --- RAG Semantic Search ---
         tool(
             "rag_search",
@@ -369,7 +366,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         ),
-
         // --- Important/Pinned Memory ---
         tool(
             "set_important_memory",
@@ -407,7 +403,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["segment"]
             }),
         ),
-
         // --- HTTP Request ---
         tool(
             "generic_http_request",
@@ -475,7 +470,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["url"]
             }),
         ),
-
         // --- Python Execution ---
         tool(
             "run_python",
@@ -518,7 +512,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["code"]
             }),
         ),
-
         // --- Maigret OSINT ---
         tool(
             "maigret_osint",
@@ -559,7 +552,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         ),
-
         // --- Voice Message (TTS) ---
         tool(
             "send_voice",
@@ -601,8 +593,65 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["text"]
             }),
         ),
-
         // --- MCP Server Interaction ---
+        tool(
+            "crud_file",
+            "Create, read, list, update, and delete text files under a configured safe root directory.\n\
+             The root directory is `files/` relative to the program by default, or the value of config key `files_root` when set.\n\
+             SECURITY: All file paths are validated to prevent path traversal. Use relative paths only and never include `..`.\n\
+\n\
+             ACTIONS:\n\
+             - create: create a new file. Requires `path` and `content`. Optional `overwrite`.\n\
+             - read: read file contents. Requires `path`. Optional `offset` (0-based, default 0) and `line_count` (default 200) for chunked reads.\n\
+             - list: list files/folders. Optional `path` (directory) and `recursive`.\n\
+             - update: edit file contents. Requires `path` and `content` for replace/insert modes.\n\
+               - Default behavior (no offset/count/mode): replace entire file.\n\
+               - Partial replace requires `offset`; `line_count` defaults to 1 when omitted.\n\
+               - `mode`: replace (default), insert, delete, append.\n\
+             - delete: delete a file. Requires `path`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "read", "list", "update", "delete"],
+                        "description": "The CRUD action to perform."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path inside the configured files root. Must not be absolute and must not contain '..'."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content for create/update/insert/append/replace actions."
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "For create: allow replacing an existing file when true. Default: false."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Zero-based line offset for read/update/delete/insert operations."
+                    },
+                    "line_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Number of lines for read/update/delete when working with a line range. For read, this is the page size."
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "For list: include nested subdirectories recursively."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "insert", "delete", "append"],
+                        "description": "Update mode. `replace` is default when no mode is provided."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ),
         tool(
             "mcp_list_tools",
             "Discover tools/methods available on registered MCP servers (tcp/http transports only). \
@@ -658,13 +707,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
 
 const MCP_DYNAMIC_CONNECT_RETRY_SECS: u64 = 300;
 static MCP_DYNAMIC_CONNECT_RETRY_AFTER: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+const FILES_TOOL_DEFAULT_ROOT: &str = "files";
+const FILES_TOOL_ROOT_KEY: &str = "files_root";
+const FILES_TOOL_LIST_LIMIT: usize = 500;
+const FILES_TOOL_DEFAULT_READ_LIMIT: usize = 200;
 
 fn mcp_dynamic_retry_map() -> &'static Mutex<HashMap<String, Instant>> {
     MCP_DYNAMIC_CONNECT_RETRY_AFTER.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn mcp_dynamic_connect_allowed(server_name: &str, now: Instant) -> bool {
-    let map = mcp_dynamic_retry_map().lock().unwrap_or_else(|e| e.into_inner());
+    let map = mcp_dynamic_retry_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match map.get(server_name) {
         Some(next_allowed_at) => *next_allowed_at <= now,
         None => true,
@@ -672,7 +727,9 @@ fn mcp_dynamic_connect_allowed(server_name: &str, now: Instant) -> bool {
 }
 
 fn mcp_dynamic_mark_connect_failure(server_name: &str, now: Instant) {
-    let mut map = mcp_dynamic_retry_map().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = mcp_dynamic_retry_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     map.insert(
         server_name.to_string(),
         now + Duration::from_secs(MCP_DYNAMIC_CONNECT_RETRY_SECS),
@@ -680,17 +737,16 @@ fn mcp_dynamic_mark_connect_failure(server_name: &str, now: Instant) {
 }
 
 fn mcp_dynamic_clear_connect_failure(server_name: &str) {
-    let mut map = mcp_dynamic_retry_map().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = mcp_dynamic_retry_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     map.remove(server_name);
 }
 
 /// Generate dynamic tool definitions from connected MCP servers.
 /// Each MCP tool becomes a first-class LLM tool named `mcp__{server}__{method}`
 /// so the LLM fills in parameters naturally without the mcp_call indirection.
-pub async fn mcp_dynamic_definitions(
-    mcp: &McpManager,
-    pool: &SqlitePool,
-) -> Vec<ToolDefinition> {
+pub async fn mcp_dynamic_definitions(mcp: &McpManager, pool: &SqlitePool) -> Vec<ToolDefinition> {
     let mut defs = Vec::new();
 
     let servers = match db::mcp_server_list(pool, false).await {
@@ -699,7 +755,10 @@ pub async fn mcp_dynamic_definitions(
     };
 
     for server in &servers {
-        if !matches!(server.transport.as_str(), "tcp" | "http" | "sse" | "streamable_http") {
+        if !matches!(
+            server.transport.as_str(),
+            "tcp" | "http" | "sse" | "streamable_http"
+        ) {
             continue;
         }
 
@@ -737,15 +796,20 @@ pub async fn mcp_dynamic_definitions(
             let description = format!(
                 "[MCP server: {}] {}",
                 server.name,
-                if mcp_tool.description.is_empty() { &mcp_tool.name } else { &mcp_tool.description }
+                if mcp_tool.description.is_empty() {
+                    &mcp_tool.name
+                } else {
+                    &mcp_tool.description
+                }
             );
 
             // Resolve $ref / $defs in the schema so the LLM sees flat parameters
-            let parameters = if mcp_tool.input_schema.is_null() || mcp_tool.input_schema == json!({}) {
-                json!({"type": "object", "properties": {}})
-            } else {
-                resolve_json_schema_refs(&mcp_tool.input_schema)
-            };
+            let parameters =
+                if mcp_tool.input_schema.is_null() || mcp_tool.input_schema == json!({}) {
+                    json!({"type": "object", "properties": {}})
+                } else {
+                    resolve_json_schema_refs(&mcp_tool.input_schema)
+                };
 
             defs.push(ToolDefinition {
                 tool_type: "function".to_string(),
@@ -764,9 +828,7 @@ pub async fn mcp_dynamic_definitions(
 /// Resolve `$ref` references in a JSON Schema by inlining definitions.
 /// Removes `$defs`, `definitions`, and `$schema` from the top level.
 fn resolve_json_schema_refs(schema: &Value) -> Value {
-    let defs = schema.get("$defs")
-        .or(schema.get("definitions"))
-        .cloned();
+    let defs = schema.get("$defs").or(schema.get("definitions")).cloned();
 
     let mut resolved = inline_refs(schema, &defs);
 
@@ -785,7 +847,8 @@ fn inline_refs(value: &Value, defs: &Option<Value>) -> Value {
             // If this object is a $ref, replace it with the referenced definition
             if let Some(ref_val) = map.get("$ref") {
                 if let Some(ref_str) = ref_val.as_str() {
-                    let name = ref_str.strip_prefix("#/$defs/")
+                    let name = ref_str
+                        .strip_prefix("#/$defs/")
                         .or(ref_str.strip_prefix("#/definitions/"));
                     if let Some(name) = name {
                         if let Some(defs_val) = defs {
@@ -799,14 +862,13 @@ fn inline_refs(value: &Value, defs: &Option<Value>) -> Value {
             }
 
             // Recursively resolve all values in the object
-            let new_map: serde_json::Map<String, Value> = map.iter()
+            let new_map: serde_json::Map<String, Value> = map
+                .iter()
                 .map(|(k, v)| (k.clone(), inline_refs(v, defs)))
                 .collect();
             Value::Object(new_map)
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(|v| inline_refs(v, defs)).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| inline_refs(v, defs)).collect()),
         _ => value.clone(),
     }
 }
@@ -832,6 +894,7 @@ pub async fn execute(
         "memory_set" => execute_memory_set(pool, rag, &args).await,
         "memory_get" => execute_memory_get(pool, &args).await,
         "memory_list" => execute_memory_list(pool, &args).await,
+        "crud_file" => execute_crud_file(pool, &args).await,
         "crud_mcp_server" => execute_crud_mcp_server(pool, &args, user_id).await,
         // Backward-compatible aliases (if model still calls old tool names)
         "list_mcp_servers" => {
@@ -869,7 +932,9 @@ pub async fn execute(
     };
 
     // Log the tool call
-    if let Err(e) = db::tool_call_log(pool, chat_id, user_id, tool_name, arguments, &result_str).await {
+    if let Err(e) =
+        db::tool_call_log(pool, chat_id, user_id, tool_name, arguments, &result_str).await
+    {
         tracing::error!(error = %e, "Failed to log tool call");
     }
 
@@ -908,7 +973,8 @@ async fn execute_store_note(pool: &SqlitePool, rag: &RagEngine, args: &Value) ->
         "success": true,
         "note_id": note_id,
         "message": format!("Note '{}' stored with ID {} in segment '{}'", title, note_id, segment)
-    }).to_string())
+    })
+    .to_string())
 }
 
 async fn execute_search_notes(pool: &SqlitePool, args: &Value) -> Result<String> {
@@ -926,19 +992,26 @@ async fn execute_search_notes(pool: &SqlitePool, args: &Value) -> Result<String>
         let matching: Vec<_> = all_notes
             .into_iter()
             .filter(|n| re.is_match(&n.title) || re.is_match(&n.content) || re.is_match(&n.tags))
-            .map(|n| json!({
-                "id": n.id, "segment": n.segment, "title": n.title,
-                "tags": n.tags, "created_at": n.created_at,
-            }))
+            .map(|n| {
+                json!({
+                    "id": n.id, "segment": n.segment, "title": n.title,
+                    "tags": n.tags, "created_at": n.created_at,
+                })
+            })
             .collect();
 
         Ok(json!({"results": matching, "count": matching.len()}).to_string())
     } else {
         let notes = db::note_search(pool, query, segment).await?;
-        let results: Vec<_> = notes.iter().map(|n| json!({
-            "id": n.id, "segment": n.segment, "title": n.title,
-            "tags": n.tags, "created_at": n.created_at,
-        })).collect();
+        let results: Vec<_> = notes
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": n.id, "segment": n.segment, "title": n.title,
+                    "tags": n.tags, "created_at": n.created_at,
+                })
+            })
+            .collect();
         let count = results.len();
         Ok(json!({"results": results, "count": count}).to_string())
     }
@@ -954,7 +1027,8 @@ async fn execute_read_note(pool: &SqlitePool, args: &Value) -> Result<String> {
             "id": note.id, "segment": note.segment, "title": note.title,
             "content": note.content, "tags": note.tags,
             "created_at": note.created_at, "updated_at": note.updated_at,
-        }).to_string()),
+        })
+        .to_string()),
         None => Ok(json!({"error": format!("Note with ID {} not found", note_id)}).to_string()),
     }
 }
@@ -988,20 +1062,22 @@ async fn execute_memory_set(pool: &SqlitePool, rag: &RagEngine, args: &Value) ->
     memory::set(pool, segment, key, value).await?;
 
     // Index in RAG — query the memory row ID for dedup
-    if let Ok(Some((mem_id,))) = sqlx::query_as::<_, (i64,)>(
-        "SELECT id FROM memory WHERE segment = ? AND key = ?",
-    )
-    .bind(segment)
-    .bind(key)
-    .fetch_optional(pool)
-    .await
+    if let Ok(Some((mem_id,))) =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM memory WHERE segment = ? AND key = ?")
+            .bind(segment)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
     {
         let embed_text = format!("{}: {}", key, value);
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let _ = rag.index_record_sync("memory", mem_id, 0, segment, &embed_text, "", &now);
     }
 
-    Ok(json!({"success": true, "message": format!("Stored {}[{}] = '{}'", segment, key, value)}).to_string())
+    Ok(
+        json!({"success": true, "message": format!("Stored {}[{}] = '{}'", segment, key, value)})
+            .to_string(),
+    )
 }
 
 async fn execute_memory_get(pool: &SqlitePool, args: &Value) -> Result<String> {
@@ -1024,9 +1100,14 @@ async fn execute_memory_list(pool: &SqlitePool, args: &Value) -> Result<String> 
         .ok_or_else(|| anyhow::anyhow!("Missing 'segment'"))?;
 
     let entries = memory::list(pool, segment).await?;
-    let items: Vec<_> = entries.iter().map(|m| json!({
-        "key": m.key, "value": m.value, "updated_at": m.updated_at,
-    })).collect();
+    let items: Vec<_> = entries
+        .iter()
+        .map(|m| {
+            json!({
+                "key": m.key, "value": m.value, "updated_at": m.updated_at,
+            })
+        })
+        .collect();
     let count = items.len();
     Ok(json!({"segment": segment, "entries": items, "count": count}).to_string())
 }
@@ -1035,6 +1116,562 @@ fn with_action(args: &Value, action: &str) -> Value {
     let mut enriched = args.clone();
     enriched["action"] = json!(action);
     enriched
+}
+
+async fn resolve_file_root(pool: &SqlitePool) -> Result<PathBuf> {
+    let configured = config::get(pool, FILES_TOOL_ROOT_KEY).await?;
+    let root = configured.unwrap_or_else(|| FILES_TOOL_DEFAULT_ROOT.to_string());
+    let trimmed = root.trim();
+    let root_path = if trimmed.is_empty() {
+        std::env::current_dir()?.join(FILES_TOOL_DEFAULT_ROOT)
+    } else {
+        let configured_path = Path::new(trimmed);
+        if configured_path.is_absolute() {
+            configured_path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(configured_path)
+        }
+    };
+
+    tokio::fs::create_dir_all(&root_path).await?;
+    Ok(tokio::fs::canonicalize(&root_path).await?)
+}
+
+fn sanitize_file_path(raw: &str, allow_empty: bool) -> Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        if allow_empty {
+            return Ok(PathBuf::new());
+        }
+        anyhow::bail!("Path is required for this action");
+    }
+
+    if raw == "." {
+        return if allow_empty {
+            Ok(PathBuf::new())
+        } else {
+            anyhow::bail!("Path '.' is not allowed; provide a target file path");
+        };
+    }
+
+    let input_path = Path::new(raw);
+    if input_path.is_absolute() {
+        anyhow::bail!("Absolute paths are not allowed");
+    }
+
+    let mut safe = PathBuf::new();
+    for component in input_path.components() {
+        match component {
+            Component::Prefix(_) => anyhow::bail!("Invalid path prefix in '{}'", raw),
+            Component::RootDir => anyhow::bail!("Absolute path component is not allowed"),
+            Component::CurDir => {}
+            Component::ParentDir => anyhow::bail!("Path traversal using '..' is not allowed"),
+            Component::Normal(seg) => safe.push(seg),
+        }
+    }
+
+    if safe.as_os_str().is_empty() {
+        if allow_empty {
+            Ok(safe)
+        } else {
+            anyhow::bail!("Path is required for this action");
+        }
+    } else {
+        Ok(safe)
+    }
+}
+
+async fn resolve_file_path(pool: &SqlitePool, raw: &str, allow_empty: bool) -> Result<PathBuf> {
+    let root = resolve_file_root(pool).await?;
+    let relative = sanitize_file_path(raw, allow_empty)?;
+    let candidate = root.join(relative);
+
+    if let Ok(canonical) = tokio::fs::canonicalize(&candidate).await {
+        if !canonical.starts_with(&root) {
+            anyhow::bail!("Path escapes the configured root directory");
+        }
+        return Ok(canonical);
+    }
+
+    // Candidate may not exist (new file). Validate the nearest existing ancestor
+    // to avoid creating/reading through a symlink outside root.
+    let mut check_path = candidate.clone();
+    while check_path != root {
+        if let Ok(true) = tokio::fs::try_exists(&check_path).await {
+            let canonical_check = tokio::fs::canonicalize(&check_path).await?;
+            if !canonical_check.starts_with(&root) {
+                anyhow::bail!("Path escapes the configured root directory");
+            }
+            break;
+        }
+        match check_path.parent() {
+            Some(parent) => check_path = parent.to_path_buf(),
+            None => break,
+        }
+    }
+
+    Ok(candidate)
+}
+
+fn display_file_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+async fn execute_crud_file(pool: &SqlitePool, args: &Value) -> Result<String> {
+    let action = args["action"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'action'"))?
+        .to_lowercase();
+
+    let root = resolve_file_root(pool).await?;
+
+    match action.as_str() {
+        "create" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'content' for create action"))?;
+            let overwrite = args["overwrite"].as_bool().unwrap_or(false);
+
+            if path.trim().is_empty() {
+                return Ok(json!({
+                    "success": false,
+                    "error": "Missing 'path' for create action"
+                })
+                .to_string());
+            }
+
+            let file_path = resolve_file_path(pool, path, false).await?;
+            if !overwrite && tokio::fs::try_exists(&file_path).await? {
+                return Ok(json!({
+                    "success": false,
+                    "error": "File already exists. Set overwrite=true to replace it.",
+                    "path": display_file_path(&root, &file_path),
+                })
+                .to_string());
+            }
+
+            if let Some(parent) = file_path.parent() {
+                if !tokio::fs::try_exists(parent).await? {
+                    return Ok(json!({
+                        "error": format!("Parent directory '{}' does not exist", display_file_path(&root, parent)),
+                        "path": display_file_path(&root, &file_path),
+                    })
+                    .to_string());
+                }
+            }
+
+            tokio::fs::write(&file_path, content).await?;
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            Ok(json!({
+                "success": true,
+                "action": "create",
+                "path": display_file_path(&root, &file_path),
+                "bytes": metadata.len(),
+                "overwrite": overwrite,
+            })
+            .to_string())
+        }
+        "read" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if path.trim().is_empty() {
+                return Ok(
+                    json!({"success": false, "error": "Missing 'path' for read action"})
+                        .to_string(),
+                );
+            }
+
+            let file_path = resolve_file_path(pool, path, false).await?;
+            if !tokio::fs::try_exists(&file_path).await? {
+                return Ok(json!({
+                    "success": false,
+                    "message": format!("File '{}' not found", display_file_path(&root, &file_path))
+                })
+                .to_string());
+            }
+
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            if metadata.is_dir() {
+                return Ok(json!({
+                    "success": false,
+                    "error": format!("'{}' is a directory", display_file_path(&root, &file_path))
+                })
+                .to_string());
+            }
+
+            let content = match tokio::fs::read_to_string(&file_path).await {
+                Ok(content) => content,
+                Err(e) => {
+                    return Ok(json!({
+                        "success": false,
+                        "error": format!(
+                            "Failed to read '{}': {}",
+                            display_file_path(&root, &file_path),
+                            e
+                        )
+                    })
+                    .to_string());
+                }
+            };
+
+            let lines: Vec<&str> = content.split('\n').collect();
+            let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+            let line_count = args["line_count"].as_u64().map(|v| v as usize);
+
+            if let Some(count) = line_count {
+                if count == 0 {
+                    return Ok(json!({
+                        "success": false,
+                        "path": display_file_path(&root, &file_path),
+                        "error": "line_count must be a positive integer",
+                        "line_count": count
+                    })
+                    .to_string());
+                }
+            }
+
+            if offset > lines.len() {
+                return Ok(json!({
+                    "success": false,
+                    "path": display_file_path(&root, &file_path),
+                    "error": "Offset is beyond end of file",
+                    "offset": offset,
+                    "total_lines": lines.len()
+                })
+                .to_string());
+            }
+
+            if offset == lines.len() {
+                return Ok(json!({
+                    "success": true,
+                    "action": "read",
+                    "path": display_file_path(&root, &file_path),
+                    "size_bytes": metadata.len(),
+                    "total_lines": lines.len(),
+                    "offset": offset,
+                    "line_count": 0,
+                    "content": "",
+                    "has_more": false
+                })
+                .to_string());
+            }
+
+            let take = line_count
+                .unwrap_or(FILES_TOOL_DEFAULT_READ_LIMIT)
+                .min(lines.len() - offset);
+            let end = offset + take;
+            let selected = lines[offset..end].join("\n");
+
+            Ok(json!({
+                "success": true,
+                "action": "read",
+                "path": display_file_path(&root, &file_path),
+                "size_bytes": metadata.len(),
+                "offset": offset,
+                "line_count": take,
+                "total_lines": lines.len(),
+                "content": selected,
+                "has_more": end < lines.len()
+            })
+            .to_string())
+        }
+        "update" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if path.trim().is_empty() {
+                return Ok(
+                    json!({"success": false, "error": "Missing 'path' for update action"})
+                        .to_string(),
+                );
+            }
+
+            let file_path = resolve_file_path(pool, path, false).await?;
+            if !tokio::fs::try_exists(&file_path).await? {
+                return Ok(json!({
+                    "success": false,
+                    "message": format!("File '{}' not found", display_file_path(&root, &file_path))
+                })
+                .to_string());
+            }
+
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            if metadata.is_dir() {
+                return Ok(json!({
+                    "success": false,
+                    "error": format!("'{}' is a directory", display_file_path(&root, &file_path))
+                })
+                .to_string());
+            }
+
+            let mode = args["mode"].as_str().unwrap_or("replace");
+            let offset = args["offset"].as_u64().map(|v| v as usize);
+            let line_count = args["line_count"].as_u64().map(|v| v as usize);
+
+            if let Some(count) = line_count {
+                if count == 0 {
+                    return Ok(json!({
+                        "success": false,
+                        "error": "line_count must be a positive integer",
+                        "path": display_file_path(&root, &file_path)
+                    })
+                    .to_string());
+                }
+            }
+
+            let valid_mode = matches!(mode, "replace" | "insert" | "delete" | "append");
+            if !valid_mode {
+                return Ok(json!({
+                    "success": false,
+                    "error": "Invalid update mode. Expected one of: replace, insert, delete, append",
+                    "path": display_file_path(&root, &file_path),
+                    "mode": mode
+                }).to_string());
+            }
+
+            let existing = tokio::fs::read_to_string(&file_path).await?;
+            let mut lines: Vec<String> =
+                existing.split('\n').map(|line| line.to_string()).collect();
+            let total_lines = lines.len();
+
+            match mode {
+                "replace" => {
+                    if offset.is_none() && line_count.is_none() {
+                        let content = args["content"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("Missing 'content' for full replace"))?;
+                        tokio::fs::write(&file_path, content).await?;
+                    } else {
+                        let offset = offset.unwrap_or(0);
+                        let line_count = line_count.unwrap_or(1);
+
+                        if offset > lines.len() {
+                            return Ok(json!({
+                                "success": false,
+                                "error": "Offset is beyond end of file",
+                                "path": display_file_path(&root, &file_path),
+                                "offset": offset,
+                                "total_lines": total_lines
+                            })
+                            .to_string());
+                        }
+
+                        let content = args["content"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("Missing 'content' for replace mode"))?;
+                        let replacement: Vec<String> =
+                            content.split('\n').map(|line| line.to_string()).collect();
+                        let end = std::cmp::min(lines.len(), offset + line_count);
+                        lines.splice(offset..end, replacement);
+                        tokio::fs::write(&file_path, lines.join("\n")).await?;
+                    }
+                }
+                "insert" => {
+                    let content = args["content"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Missing 'content' for insert mode"))?;
+                    let insert_pos = offset.unwrap_or(lines.len());
+                    if insert_pos > lines.len() {
+                        return Ok(json!({
+                            "success": false,
+                            "error": "Offset is beyond end of file",
+                            "path": display_file_path(&root, &file_path),
+                            "offset": insert_pos,
+                            "total_lines": total_lines
+                        })
+                        .to_string());
+                    }
+
+                    let insertion: Vec<String> =
+                        content.split('\n').map(|line| line.to_string()).collect();
+                    lines.splice(insert_pos..insert_pos, insertion);
+                    tokio::fs::write(&file_path, lines.join("\n")).await?;
+                }
+                "append" => {
+                    let content = args["content"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("Missing 'content' for append mode"))?;
+                    if !lines.is_empty() {
+                        lines.extend(content.split('\n').map(|line| line.to_string()));
+                    } else {
+                        lines = content.split('\n').map(|line| line.to_string()).collect();
+                    }
+                    tokio::fs::write(&file_path, lines.join("\n")).await?;
+                }
+                "delete" => {
+                    let line_count = line_count.unwrap_or(1);
+                    let offset = offset.unwrap_or(0);
+                    if offset >= lines.len() {
+                        return Ok(json!({
+                            "success": false,
+                            "error": "Offset is beyond end of file",
+                            "path": display_file_path(&root, &file_path),
+                            "offset": offset,
+                            "total_lines": total_lines
+                        })
+                        .to_string());
+                    }
+
+                    let end = std::cmp::min(lines.len(), offset + line_count);
+                    lines.splice(offset..end, std::iter::empty());
+                    tokio::fs::write(&file_path, lines.join("\n")).await?;
+                }
+                _ => {}
+            }
+
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            Ok(json!({
+                "success": true,
+                "action": "update",
+                "path": display_file_path(&root, &file_path),
+                "bytes": metadata.len(),
+            })
+            .to_string())
+        }
+        "delete" => {
+            let path = args["path"].as_str().unwrap_or("");
+            if path.trim().is_empty() {
+                return Ok(
+                    json!({"success": false, "error": "Missing 'path' for delete action"})
+                        .to_string(),
+                );
+            }
+
+            let file_path = resolve_file_path(pool, path, false).await?;
+            if !tokio::fs::try_exists(&file_path).await? {
+                return Ok(json!({
+                    "success": false,
+                    "message": format!("File '{}' not found", display_file_path(&root, &file_path))
+                })
+                .to_string());
+            }
+
+            let metadata = tokio::fs::metadata(&file_path).await?;
+            if metadata.is_dir() {
+                return Ok(json!({
+                    "success": false,
+                    "error": format!("'{}' is a directory. Use list only for directories.", display_file_path(&root, &file_path))
+                }).to_string());
+            }
+
+            tokio::fs::remove_file(&file_path).await?;
+            Ok(json!({
+                "success": true,
+                "action": "delete",
+                "path": display_file_path(&root, &file_path),
+            })
+            .to_string())
+        }
+        "list" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let recursive = args["recursive"].as_bool().unwrap_or(false);
+            let target = resolve_file_path(pool, path, true).await?;
+            let list_root = if path.trim().is_empty() {
+                root.clone()
+            } else {
+                target
+            };
+
+            let metadata = match tokio::fs::metadata(&list_root).await {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    return Ok(json!({
+                        "success": false,
+                        "error": format!(
+                            "Path '{}' not found or not accessible: {}",
+                            display_file_path(&root, &list_root),
+                            e
+                        )
+                    })
+                    .to_string());
+                }
+            };
+            if !metadata.is_dir() {
+                return Ok(json!({
+                    "success": false,
+                    "error": format!("'{}' is not a directory", display_file_path(&root, &list_root))
+                }).to_string());
+            }
+
+            let mut queue = vec![list_root.clone()];
+            let mut entries = Vec::new();
+            let mut truncated = false;
+
+            while let Some(dir_path) = queue.pop() {
+                let mut dir_entries = match tokio::fs::read_dir(&dir_path).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return Ok(json!({
+                            "success": false,
+                            "error": format!(
+                                "Failed to read directory '{}': {}",
+                                display_file_path(&root, &dir_path),
+                                e
+                            )
+                        })
+                        .to_string());
+                    }
+                };
+
+                while let Some(entry) = dir_entries.next_entry().await? {
+                    if entries.len() >= FILES_TOOL_LIST_LIMIT {
+                        truncated = true;
+                        break;
+                    }
+
+                    let entry_path = entry.path();
+                    let entry_name = entry.file_name().to_string_lossy().to_string();
+                    let file_type = entry.file_type().await?;
+
+                    let metadata = tokio::fs::metadata(&entry_path).await;
+                    let is_symlink = file_type.is_symlink();
+                    let (kind, size_bytes, is_dir) = match metadata {
+                        Ok(meta) => {
+                            let kind = if meta.is_dir() {
+                                "dir"
+                            } else if is_symlink {
+                                "symlink"
+                            } else {
+                                "file"
+                            };
+                            (kind, meta.len(), meta.is_dir())
+                        }
+                        Err(_) => ("unknown", 0, false),
+                    };
+
+                    entries.push(json!({
+                        "name": entry_name,
+                        "path": display_file_path(&root, &entry_path),
+                        "kind": kind,
+                        "size_bytes": size_bytes,
+                    }));
+
+                    if recursive && is_dir && !is_symlink {
+                        queue.push(entry_path);
+                    }
+                }
+
+                if truncated {
+                    break;
+                }
+            }
+
+            Ok(json!({
+                "success": true,
+                "action": "list",
+                "path": display_file_path(&root, &list_root),
+                "count": entries.len(),
+                "truncated": truncated,
+                "limit": FILES_TOOL_LIST_LIMIT,
+                "entries": entries,
+            })
+            .to_string())
+        }
+        _ => Ok(
+            json!({"error": "Invalid action. Expected one of: create, read, list, update, delete"})
+                .to_string(),
+        ),
+    }
 }
 
 fn parse_json_or_default(value: Option<&Value>, fallback: &str) -> Result<String> {
@@ -1065,15 +1702,13 @@ fn normalize_transport(transport: &str) -> Result<String> {
     }
 }
 
-fn validate_mcp_runtime(
-    transport: &str,
-    command: &str,
-    endpoint: &str,
-) -> Result<()> {
+fn validate_mcp_runtime(transport: &str, command: &str, endpoint: &str) -> Result<()> {
     match transport {
         "stdio" => {
             if command.trim().is_empty() {
-                anyhow::bail!("Transport 'stdio' requires a `command` field (e.g. 'npx -y @modelcontextprotocol/server-sqlite'). Ask the user what command to run.");
+                anyhow::bail!(
+                    "Transport 'stdio' requires a `command` field (e.g. 'npx -y @modelcontextprotocol/server-sqlite'). Ask the user what command to run."
+                );
             }
         }
         "tcp" => {
@@ -1157,11 +1792,7 @@ fn validate_tcp_endpoint(endpoint: &str) -> Result<()> {
     Ok(())
 }
 
-async fn execute_crud_mcp_server(
-    pool: &SqlitePool,
-    args: &Value,
-    actor_id: i64,
-) -> Result<String> {
+async fn execute_crud_mcp_server(pool: &SqlitePool, args: &Value, actor_id: i64) -> Result<String> {
     let action = args["action"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing 'action'"))?
@@ -1184,20 +1815,22 @@ async fn execute_crud_mcp_server_list(pool: &SqlitePool, _args: &Value) -> Resul
     let servers = db::mcp_server_list(pool, false).await?;
     let items: Vec<_> = servers
         .iter()
-        .map(|server| json!({
-            "id": server.id,
-            "name": server.name,
-            "description": server.description,
-            "transport": server.transport,
-            "endpoint": server.endpoint,
-            "command": server.command,
-            "args": parse_json_fallback(&server.args),
-            "environment": parse_json_fallback(&server.environment),
-            "created_by": server.created_by,
-            "updated_by": server.updated_by,
-            "created_at": server.created_at,
-            "updated_at": server.updated_at,
-        }))
+        .map(|server| {
+            json!({
+                "id": server.id,
+                "name": server.name,
+                "description": server.description,
+                "transport": server.transport,
+                "endpoint": server.endpoint,
+                "command": server.command,
+                "args": parse_json_fallback(&server.args),
+                "environment": parse_json_fallback(&server.environment),
+                "created_by": server.created_by,
+                "updated_by": server.updated_by,
+                "created_at": server.created_at,
+                "updated_at": server.updated_at,
+            })
+        })
         .collect();
 
     let count = items.len();
@@ -1363,7 +1996,9 @@ async fn execute_crud_mcp_server_update(
         }
     }
 
-    let description = args["description"].as_str().unwrap_or(&existing.description);
+    let description = args["description"]
+        .as_str()
+        .unwrap_or(&existing.description);
     let command = args["command"]
         .as_str()
         .unwrap_or(&existing.command)
@@ -1474,20 +2109,33 @@ async fn execute_search_history(pool: &SqlitePool, args: &Value, chat_id: i64) -
     let offset = args["offset"].as_i64().unwrap_or(0);
 
     let rows = db::conversation_search(
-        pool, chat_id, keyword, sender_name, sender_id,
-        date_from, date_to, limit, offset,
-    ).await?;
+        pool,
+        chat_id,
+        keyword,
+        sender_name,
+        sender_id,
+        date_from,
+        date_to,
+        limit,
+        offset,
+    )
+    .await?;
 
-    let messages: Vec<_> = rows.iter().map(|r| json!({
-        "id": r.id,
-        "message_id": r.message_id,
-        "reply_to_id": r.reply_to_id,
-        "user_name": r.user_name,
-        "user_id": r.user_id,
-        "role": r.role,
-        "content": r.content,
-        "created_at": r.created_at,
-    })).collect();
+    let messages: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "message_id": r.message_id,
+                "reply_to_id": r.reply_to_id,
+                "user_name": r.user_name,
+                "user_id": r.user_id,
+                "role": r.role,
+                "content": r.content,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
 
     let count = messages.len();
     Ok(json!({
@@ -1495,27 +2143,32 @@ async fn execute_search_history(pool: &SqlitePool, args: &Value, chat_id: i64) -
         "count": count,
         "has_more": count as i64 == limit,
         "offset": offset,
-    }).to_string())
+    })
+    .to_string())
 }
 
 async fn execute_browse_history(pool: &SqlitePool, args: &Value, chat_id: i64) -> Result<String> {
     let offset = args["offset"].as_i64().unwrap_or(0);
     let limit = args["limit"].as_i64().unwrap_or(20).min(50);
 
-    let rows = db::conversation_search(
-        pool, chat_id, None, None, None, None, None, limit, offset,
-    ).await?;
+    let rows =
+        db::conversation_search(pool, chat_id, None, None, None, None, None, limit, offset).await?;
 
-    let messages: Vec<_> = rows.iter().map(|r| json!({
-        "id": r.id,
-        "message_id": r.message_id,
-        "reply_to_id": r.reply_to_id,
-        "user_name": r.user_name,
-        "user_id": r.user_id,
-        "role": r.role,
-        "content": r.content,
-        "created_at": r.created_at,
-    })).collect();
+    let messages: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "message_id": r.message_id,
+                "reply_to_id": r.reply_to_id,
+                "user_name": r.user_name,
+                "user_id": r.user_id,
+                "role": r.role,
+                "content": r.content,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
 
     let count = messages.len();
     Ok(json!({
@@ -1524,7 +2177,8 @@ async fn execute_browse_history(pool: &SqlitePool, args: &Value, chat_id: i64) -
         "offset": offset,
         "next_offset": offset + count as i64,
         "has_more": count as i64 == limit,
-    }).to_string())
+    })
+    .to_string())
 }
 
 async fn execute_search_all_chats(pool: &SqlitePool, args: &Value) -> Result<String> {
@@ -1537,28 +2191,45 @@ async fn execute_search_all_chats(pool: &SqlitePool, args: &Value) -> Result<Str
     let offset = args["offset"].as_i64().unwrap_or(0);
 
     // Require at least one filter
-    if keyword.is_none() && sender_name.is_none() && sender_id.is_none() && date_from.is_none() && date_to.is_none() {
+    if keyword.is_none()
+        && sender_name.is_none()
+        && sender_id.is_none()
+        && date_from.is_none()
+        && date_to.is_none()
+    {
         return Ok(json!({
             "error": "At least one filter (keyword, sender_name, sender_id, date_from, date_to) is required to search across all chats."
         }).to_string());
     }
 
     let rows = db::conversation_search_global(
-        pool, keyword, sender_name, sender_id,
-        date_from, date_to, limit, offset,
-    ).await?;
+        pool,
+        keyword,
+        sender_name,
+        sender_id,
+        date_from,
+        date_to,
+        limit,
+        offset,
+    )
+    .await?;
 
-    let messages: Vec<_> = rows.iter().map(|r| json!({
-        "id": r.id,
-        "chat_id": r.chat_id,
-        "message_id": r.message_id,
-        "reply_to_id": r.reply_to_id,
-        "user_name": r.user_name,
-        "user_id": r.user_id,
-        "role": r.role,
-        "content": r.content,
-        "created_at": r.created_at,
-    })).collect();
+    let messages: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "chat_id": r.chat_id,
+                "message_id": r.message_id,
+                "reply_to_id": r.reply_to_id,
+                "user_name": r.user_name,
+                "user_id": r.user_id,
+                "role": r.role,
+                "content": r.content,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
 
     let count = messages.len();
     Ok(json!({
@@ -1566,7 +2237,8 @@ async fn execute_search_all_chats(pool: &SqlitePool, args: &Value) -> Result<Str
         "count": count,
         "has_more": count as i64 == limit,
         "offset": offset,
-    }).to_string())
+    })
+    .to_string())
 }
 
 // --- Important Memory Tools ---
@@ -1646,7 +2318,9 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         "DELETE" => client.delete(url),
         "PATCH" => client.patch(url),
         "HEAD" => client.head(url),
-        _ => return Ok(json!({"error": format!("Unsupported HTTP method: {}", method)}).to_string()),
+        _ => {
+            return Ok(json!({"error": format!("Unsupported HTTP method: {}", method)}).to_string());
+        }
     };
 
     // Default headers
@@ -1698,7 +2372,12 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         {
             Ok(resp) => {
                 if resp.status().is_server_error() && attempt < HTTP_MAX_RETRIES - 1 {
-                    last_error = Some(format!("HTTP {} (attempt {}/{})", resp.status().as_u16(), attempt + 1, HTTP_MAX_RETRIES));
+                    last_error = Some(format!(
+                        "HTTP {} (attempt {}/{})",
+                        resp.status().as_u16(),
+                        attempt + 1,
+                        HTTP_MAX_RETRIES
+                    ));
                     continue;
                 }
                 response_opt = Some(resp);
@@ -1714,10 +2393,12 @@ async fn execute_http_request(args: &Value) -> Result<String> {
                 });
                 if e.is_timeout() {
                     error_info["reason"] = json!("timeout");
-                    error_info["detail"] = json!(format!("Request timed out after {}s", timeout_secs));
+                    error_info["detail"] =
+                        json!(format!("Request timed out after {}s", timeout_secs));
                 } else if e.is_connect() {
                     error_info["reason"] = json!("connection_failed");
-                    error_info["detail"] = json!("Could not connect. DNS resolution failed or host is unreachable.");
+                    error_info["detail"] =
+                        json!("Could not connect. DNS resolution failed or host is unreachable.");
                 } else if e.is_redirect() {
                     error_info["reason"] = json!("too_many_redirects");
                 } else {
@@ -1745,13 +2426,18 @@ async fn execute_http_request(args: &Value) -> Result<String> {
                 "last_error": last_error,
                 "url": url,
                 "method": method,
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
     // Collect response metadata
     let status = response.status().as_u16();
-    let status_text = response.status().canonical_reason().unwrap_or("").to_string();
+    let status_text = response
+        .status()
+        .canonical_reason()
+        .unwrap_or("")
+        .to_string();
     let content_type = response
         .headers()
         .get("content-type")
@@ -1761,7 +2447,14 @@ async fn execute_http_request(args: &Value) -> Result<String> {
 
     // Collect useful response headers
     let mut resp_headers = json!({});
-    for key in ["content-type", "content-length", "location", "retry-after", "x-ratelimit-remaining", "x-ratelimit-reset"] {
+    for key in [
+        "content-type",
+        "content-length",
+        "location",
+        "retry-after",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset",
+    ] {
         if let Some(val) = response.headers().get(key).and_then(|v| v.to_str().ok()) {
             resp_headers[key] = json!(val);
         }
@@ -1775,7 +2468,8 @@ async fn execute_http_request(args: &Value) -> Result<String> {
             "status": status,
             "status_text": status_text,
             "headers": resp_headers,
-        }).to_string());
+        })
+        .to_string());
     }
 
     // Read body
@@ -1786,7 +2480,8 @@ async fn execute_http_request(args: &Value) -> Result<String> {
                 "error": format!("Failed to read response body: {}", e),
                 "url": url,
                 "status": status,
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
@@ -1796,7 +2491,8 @@ async fn execute_http_request(args: &Value) -> Result<String> {
             "url": url,
             "status": status,
             "size_bytes": bytes.len(),
-        }).to_string());
+        })
+        .to_string());
     }
 
     let raw_body = String::from_utf8_lossy(&bytes).to_string();
@@ -1814,14 +2510,16 @@ async fn execute_http_request(args: &Value) -> Result<String> {
             "content_type": content_type,
             "headers": resp_headers,
             "body_preview": body_preview,
-        }).to_string());
+        })
+        .to_string());
     }
 
     // Determine how to process the response
-    let is_json = response_type == "json"
-        || (response_type == "auto" && content_type.contains("json"));
+    let is_json =
+        response_type == "json" || (response_type == "auto" && content_type.contains("json"));
     let is_html = response_type == "html"
-        || (response_type == "auto" && (content_type.contains("html") || content_type.contains("xhtml")));
+        || (response_type == "auto"
+            && (content_type.contains("html") || content_type.contains("xhtml")));
 
     let content = if is_json {
         // Parse as JSON and return structured
@@ -1834,8 +2532,8 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         }
     } else if is_html && strip_html {
         // Convert HTML to clean plain text
-        let text = html2text::from_read(raw_body.as_bytes(), 80)
-            .unwrap_or_else(|_| raw_body.clone());
+        let text =
+            html2text::from_read(raw_body.as_bytes(), 80).unwrap_or_else(|_| raw_body.clone());
 
         // Collapse excessive blank lines
         let mut cleaned = String::with_capacity(text.len());
@@ -1868,7 +2566,12 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         let cut = content[..boundary]
             .rfind(|c: char| c.is_whitespace())
             .unwrap_or(boundary);
-        format!("{}...\n\n[TRUNCATED: {}/{} chars]", &content[..cut], cut, content.len())
+        format!(
+            "{}...\n\n[TRUNCATED: {}/{} chars]",
+            &content[..cut],
+            cut,
+            content.len()
+        )
     } else {
         content
     };
@@ -1885,7 +2588,8 @@ async fn execute_http_request(args: &Value) -> Result<String> {
         "returned_size": final_content.len(),
         "truncated": truncated,
         "strip_html": strip_html && is_html,
-    }).to_string())
+    })
+    .to_string())
 }
 
 // --- Python Execution ---
@@ -1965,9 +2669,15 @@ async fn execute_run_python(args: &Value) -> Result<String> {
 
     // Read-only system mounts needed for Python
     let ro_mounts = [
-        "/usr", "/lib", "/lib64", "/lib32",
-        "/etc/resolv.conf", "/etc/ssl", "/etc/ca-certificates",
-        "/etc/alternatives", "/etc/ld.so.cache",
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/lib32",
+        "/etc/resolv.conf",
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
     ];
     for path in &ro_mounts {
         if tokio::fs::metadata(path).await.is_ok() {
@@ -1983,11 +2693,17 @@ async fn execute_run_python(args: &Value) -> Result<String> {
     // Filesystem
     cmd_args.extend(bind_args);
     cmd_args.extend([
-        "--bind".to_string(), workspace.to_string_lossy().to_string(), "/workspace".to_string(),
-        "--proc".to_string(), "/proc".to_string(),
-        "--dev".to_string(), "/dev".to_string(),
-        "--tmpfs".to_string(), "/tmp".to_string(),
-        "--chdir".to_string(), "/workspace".to_string(),
+        "--bind".to_string(),
+        workspace.to_string_lossy().to_string(),
+        "/workspace".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+        "--chdir".to_string(),
+        "/workspace".to_string(),
     ]);
 
     // Isolation: unshare everything except network
@@ -2027,7 +2743,8 @@ async fn execute_run_python(args: &Value) -> Result<String> {
             return Ok(json!({
                 "error": format!("Failed to launch sandbox: {}", e),
                 "hint": "Ensure 'bwrap' (bubblewrap) is installed: apt install bubblewrap",
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
@@ -2065,7 +2782,8 @@ async fn execute_run_python(args: &Value) -> Result<String> {
         "timed_out": timed_out,
         "timeout_secs": timeout_secs,
         "files_created": created_files,
-    }).to_string())
+    })
+    .to_string())
 }
 
 // --- Maigret OSINT ---
@@ -2288,9 +3006,15 @@ print(json.dumps({
     let mut bind_args: Vec<String> = Vec::new();
 
     let ro_mounts = [
-        "/usr", "/lib", "/lib64", "/lib32",
-        "/etc/resolv.conf", "/etc/ssl", "/etc/ca-certificates",
-        "/etc/alternatives", "/etc/ld.so.cache",
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/lib32",
+        "/etc/resolv.conf",
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/etc/alternatives",
+        "/etc/ld.so.cache",
     ];
     for path in &ro_mounts {
         if tokio::fs::metadata(path).await.is_ok() {
@@ -2312,12 +3036,20 @@ print(json.dumps({
     let mut cmd_args = Vec::new();
     cmd_args.extend(bind_args);
     cmd_args.extend([
-        "--bind".to_string(), workspace.to_string_lossy().to_string(), "/workspace".to_string(),
-        "--proc".to_string(), "/proc".to_string(),
-        "--dev".to_string(), "/dev".to_string(),
-        "--tmpfs".to_string(), "/tmp".to_string(),
-        "--setenv".to_string(), "HOME".to_string(), home,
-        "--chdir".to_string(), "/workspace".to_string(),
+        "--bind".to_string(),
+        workspace.to_string_lossy().to_string(),
+        "/workspace".to_string(),
+        "--proc".to_string(),
+        "/proc".to_string(),
+        "--dev".to_string(),
+        "/dev".to_string(),
+        "--tmpfs".to_string(),
+        "/tmp".to_string(),
+        "--setenv".to_string(),
+        "HOME".to_string(),
+        home,
+        "--chdir".to_string(),
+        "/workspace".to_string(),
         "--unshare-user".to_string(),
         "--unshare-pid".to_string(),
         "--unshare-ipc".to_string(),
@@ -2348,7 +3080,8 @@ print(json.dumps({
             return Ok(json!({
                 "error": format!("Failed to launch sandbox: {}", e),
                 "hint": "Ensure 'bwrap' (bubblewrap) is installed: sudo apt install bubblewrap",
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
@@ -2365,7 +3098,8 @@ print(json.dumps({
             "error": "Maigret scan timed out",
             "timeout_secs": total_timeout,
             "query": query,
-        }).to_string());
+        })
+        .to_string());
     }
 
     // Parse stdout JSON (Python script outputs clean JSON)
@@ -2389,7 +3123,8 @@ print(json.dumps({
         "stdout": stdout_raw.chars().take(5000).collect::<String>(),
         "stderr": stderr_raw.chars().take(3000).collect::<String>(),
         "query": query,
-    }).to_string())
+    })
+    .to_string())
 }
 
 // --- Voice Message (TTS) ---
@@ -2466,7 +3201,8 @@ async fn execute_send_voice(
         Err(e) => {
             return Ok(json!({
                 "error": format!("Failed to call OpenAI TTS: {}", e),
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
@@ -2476,7 +3212,8 @@ async fn execute_send_voice(
         return Ok(json!({
             "error": format!("OpenAI TTS API error: HTTP {}", status),
             "detail": error_body,
-        }).to_string());
+        })
+        .to_string());
     }
 
     // Get audio bytes
@@ -2485,7 +3222,8 @@ async fn execute_send_voice(
         Err(e) => {
             return Ok(json!({
                 "error": format!("Failed to read TTS response: {}", e),
-            }).to_string());
+            })
+            .to_string());
         }
     };
 
@@ -2502,13 +3240,13 @@ async fn execute_send_voice(
                 "audio_size_bytes": audio_size,
                 "model": model,
                 "voice": voice,
-            }).to_string())
+            })
+            .to_string())
         }
-        Err(e) => {
-            Ok(json!({
-                "error": format!("Failed to send voice message via Telegram: {}", e),
-            }).to_string())
-        }
+        Err(e) => Ok(json!({
+            "error": format!("Failed to send voice message via Telegram: {}", e),
+        })
+        .to_string()),
     }
 }
 
@@ -2572,7 +3310,12 @@ async fn execute_mcp_list_tools(
         // All enabled servers with tcp/http transports
         let all = db::mcp_server_list(pool, false).await?;
         all.into_iter()
-            .filter(|s| matches!(s.transport.as_str(), "tcp" | "http" | "sse" | "streamable_http"))
+            .filter(|s| {
+                matches!(
+                    s.transport.as_str(),
+                    "tcp" | "http" | "sse" | "streamable_http"
+                )
+            })
             .map(|s| s.name)
             .collect()
     };
@@ -2603,11 +3346,16 @@ async fn execute_mcp_list_tools(
                     mcp.cached_tools(name).await.unwrap_or_default()
                 };
 
-                let tool_list: Vec<_> = tools.iter().map(|t| json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "inputSchema": t.input_schema,
-                })).collect();
+                let tool_list: Vec<_> = tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": t.input_schema,
+                        })
+                    })
+                    .collect();
 
                 results.push(json!({
                     "server": name,
@@ -2627,11 +3375,7 @@ async fn execute_mcp_list_tools(
     Ok(json!({"servers": results}).to_string())
 }
 
-async fn execute_mcp_call(
-    pool: &SqlitePool,
-    mcp: &McpManager,
-    args: &Value,
-) -> Result<String> {
+async fn execute_mcp_call(pool: &SqlitePool, mcp: &McpManager, args: &Value) -> Result<String> {
     let server_name = match args["server_name"].as_str() {
         Some(n) if !n.is_empty() => n,
         _ => return Ok(json!({"error": "Missing 'server_name'"}).to_string()),
@@ -2640,13 +3384,30 @@ async fn execute_mcp_call(
         Some(m) if !m.is_empty() => m,
         _ => return Ok(json!({"error": "Missing 'method'"}).to_string()),
     };
-    // Accept arguments as object or as a JSON string
+    // Accept arguments as object, as a JSON string, or as top-level keys
+    // (LLMs sometimes pass e.g. id="abc" at the top level instead of nesting
+    // inside "arguments": {"id": "abc"})
     let arguments = match args.get("arguments") {
         Some(v) if v.is_object() => v.clone(),
         Some(v) if v.is_string() => {
             serde_json::from_str(v.as_str().unwrap_or("{}")).unwrap_or(json!({}))
         }
-        _ => json!({}),
+        _ => {
+            // Collect any extra keys beyond server_name/method as implicit arguments
+            let mut implicit = serde_json::Map::new();
+            if let Some(obj) = args.as_object() {
+                for (k, v) in obj {
+                    if k != "server_name" && k != "method" && k != "arguments" {
+                        implicit.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if implicit.is_empty() {
+                json!({})
+            } else {
+                Value::Object(implicit)
+            }
+        }
     };
 
     // Pre-validate: if arguments is empty but the method requires fields, error
@@ -2657,9 +3418,8 @@ async fn execute_mcp_call(
                 if let Some(required) = tool_info.input_schema.get("required") {
                     if let Some(arr) = required.as_array() {
                         if !arr.is_empty() {
-                            let required_names: Vec<&str> = arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect();
+                            let required_names: Vec<&str> =
+                                arr.iter().filter_map(|v| v.as_str()).collect();
                             return Ok(json!({
                                 "error": format!(
                                     "Method '{}' requires arguments but none were provided. \
@@ -2670,7 +3430,8 @@ async fn execute_mcp_call(
                                     required_names.join(", "),
                                     tool_info.input_schema,
                                 )
-                            }).to_string());
+                            })
+                            .to_string());
                         }
                     }
                 }
@@ -2689,7 +3450,8 @@ async fn execute_mcp_call(
 
                 // Include the tool's inputSchema so the LLM can self-correct
                 let schema_hint = if let Some(tools) = mcp.cached_tools(server_name).await {
-                    tools.iter()
+                    tools
+                        .iter()
                         .find(|t| t.name == method)
                         .map(|t| format!(" inputSchema: {}", t.input_schema))
                         .unwrap_or_default()
@@ -2703,7 +3465,8 @@ async fn execute_mcp_call(
                          Pass the required fields in the 'arguments' parameter.{}",
                         method, server_name, code, server_err, schema_hint
                     )
-                }).to_string())
+                })
+                .to_string())
             } else {
                 Ok(json!({"success": true, "result": result}).to_string())
             }
@@ -2723,7 +3486,12 @@ async fn execute_mcp_dynamic(
     let rest = tool_name.strip_prefix("mcp__").unwrap_or(tool_name);
     let (server_name, method) = match rest.split_once("__") {
         Some((s, m)) if !s.is_empty() && !m.is_empty() => (s, m),
-        _ => return Ok(json!({"error": format!("Invalid MCP tool name format: {}", tool_name)}).to_string()),
+        _ => {
+            return Ok(
+                json!({"error": format!("Invalid MCP tool name format: {}", tool_name)})
+                    .to_string(),
+            );
+        }
     };
 
     match mcp.call_tool(pool, server_name, method, args.clone()).await {

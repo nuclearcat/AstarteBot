@@ -23,9 +23,13 @@ pub async fn get_or_default(pool: &SqlitePool, key: &str, default: &str) -> Resu
 }
 
 pub async fn get_required(pool: &SqlitePool, key: &str) -> Result<String> {
-    db::config_get(pool, key)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Required config key '{}' not set. Use: astartebot config set {} <value>", key, key))
+    db::config_get(pool, key).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Required config key '{}' not set. Use: astartebot config set {} <value>",
+            key,
+            key
+        )
+    })
 }
 
 /// Get the Telegram bot token from config or env var
